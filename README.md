@@ -65,7 +65,7 @@ export PATH="$GV_ROOT/shims:$GV_ROOT/bin:$PATH"
 
 | 命令 | 作用 |
 | --- | --- |
-| `gv install <version>` | 查索引、下载、校验 SHA256、解压。已安装则直接说明 |
+| `gv install <version>` | 查索引、下载、校验 SHA256、解压。已安装则直接说明。终端中显示下载进度；`--quiet` 或非终端只在结束时打印一行已传输字节数 |
 | `gv uninstall <version>` | 删除该 SDK。全局文件正指向它时拒绝，除非 `--force`（同时清掉全局文件） |
 | `gv list` | 列出已安装版本，并用 `*` 标出当前解析结果 |
 | `gv list-remote` | 列出 stable 版本。`--all` 含 beta、rc 等历史版本。`--refresh` 强制刷新索引 |
@@ -87,7 +87,7 @@ export PATH="$GV_ROOT/shims:$GV_ROOT/bin:$PATH"
 
 ## 下载与解压
 
-安装包是 `.tar.gz`，顶层目录为 `go/`。文件先下到内存中校验 SHA256，再解压到临时目录。路径中出现 `..`、绝对路径，或不安全的链接目标时会拒绝，然后才把临时目录原子改名为 `versions/<version>`。最终布局是 `versions/<version>/go/bin/go`。
+安装包是 `.tar.gz`，顶层目录为 `go/`。文件先下到内存中校验 SHA256，再解压到临时目录。下载过程中，终端里显示已传输字节和速度。标准错误不是终端，或传入 `--quiet` 时，不绘制进度条，只在下载结束后打印一行已传输字节数。路径中出现 `..`、绝对路径，或不安全的链接目标时会拒绝，然后才把临时目录原子改名为 `versions/<version>`。最终布局是 `versions/<version>/go/bin/go`。
 
 ## 第一版不包含
 

@@ -36,7 +36,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// 下载并安装指定的 Go 版本
-    Install { version: String },
+    Install {
+        version: String,
+        /// 不绘制进度条，结束时只打印一行已传输字节数
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// 卸载指定的 Go 版本
     Uninstall {
         version: String,
@@ -90,7 +95,9 @@ fn run() -> Result<(), Error> {
     shim::install_shims(&root)?;
 
     match cli.command {
-        Command::Install { version } => block_on(commands::install::run(&root, &version))?,
+        Command::Install { version, quiet } => {
+            block_on(commands::install::run(&root, &version, quiet))?
+        }
         Command::Uninstall { version, force } => {
             println!("{}", commands::uninstall::run(&root, &version, force)?);
         }

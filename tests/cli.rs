@@ -242,6 +242,22 @@ fn already_installed_does_not_contact_the_network() {
         String::from_utf8(output.stdout).unwrap(),
         "Go 1.2.3 已安装\n"
     );
+    assert!(output.stderr.is_empty());
+
+    let quiet = gv(root.path())
+        .args(["install", "--quiet", "1.2.3"])
+        .output()
+        .unwrap();
+    assert!(
+        quiet.status.success(),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(quiet.stdout).unwrap(),
+        "Go 1.2.3 已安装\n"
+    );
+    assert!(quiet.stderr.is_empty());
 }
 
 #[test]

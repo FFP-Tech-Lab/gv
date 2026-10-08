@@ -1,10 +1,11 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor, IsTerminal};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
@@ -290,32 +291,188 @@ pub async fn load_index(root: &Path, url: &str, refresh: bool) -> Result<LoadedI
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadUi {
+    Bar,
+    Plain,
+}
+
+fn download_ui(quiet: bool, stderr_is_tty: bool, term: Option<&str>) -> DownloadUi {
+    let dumb = term.is_some_and(|value| value == "dumb");
+    if quiet || !stderr_is_tty || dumb {
+        DownloadUi::Plain
+    } else {
+        DownloadUi::Bar
+    }
+}
+
+pub fn download_ui_for(quiet: bool) -> DownloadUi {
+    let term = std::env::var("TERM").ok();
+    download_ui(quiet, io::stderr().is_terminal(), term.as_deref())
+}
+
+fn format_transferred(
+    label: &str,
+    downloaded: u64,
+    total: Option<u64>,
+    elapsed: Duration,
+) -> String {
+    let amount = match total {
+        Some(total) => format!("{downloaded}/{total}"),
+        None => downloaded.to_string(),
+    };
+    let secs = elapsed.as_secs_f64();
+    if downloaded > 0 && secs > 0.0 {
+        let per_sec = (downloaded as f64 / secs).round() as u64;
+        format!("已传输 {label} {amount} 字节（{per_sec} 字节/秒）\n")
+    } else {
+        format!("已传输 {label} {amount} 字节\n")
+    }
+}
+
 pub async fn http_get(url: &str) -> Result<Vec<u8>, Error> {
+    let response = send_get(url).await?;
+    read_chunks(url, response, |_, _| {}).await
+}
+
+pub async fn download_archive(url: &str, label: &str, ui: DownloadUi) -> Result<Vec<u8>, Error> {
+    let response = send_get(url).await?;
+    let total = response.content_length();
+    let mut progress = TransferProgress::start(ui, label, total);
+    let bytes = read_chunks(url, response, |downloaded, _| {
+        progress.set_downloaded(downloaded);
+    })
+    .await?;
+    progress.finish_ok();
+    Ok(bytes)
+}
+
+fn http_err(url: &str, message: impl Into<String>) -> Error {
+    Error::Http {
+        url: url.to_string(),
+        message: message.into(),
+    }
+}
+
+async fn send_get(url: &str) -> Result<reqwest::Response, Error> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("gv/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(20))
         .timeout(Duration::from_secs(900))
         .build()
-        .map_err(|err| Error::Http {
-            url: url.to_string(),
-            message: err.to_string(),
-        })?;
-    let response = client.get(url).send().await.map_err(|err| Error::Http {
-        url: url.to_string(),
-        message: err.to_string(),
-    })?;
+        .map_err(|err| http_err(url, err.to_string()))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| http_err(url, err.to_string()))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(Error::Http {
-            url: url.to_string(),
-            message: format!("HTTP {status}"),
-        });
+        return Err(http_err(url, format!("HTTP {status}")));
     }
-    let bytes = response.bytes().await.map_err(|err| Error::Http {
-        url: url.to_string(),
-        message: err.to_string(),
-    })?;
-    Ok(bytes.to_vec())
+    Ok(response)
+}
+
+async fn read_chunks(
+    url: &str,
+    mut response: reqwest::Response,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, Error> {
+    let total = response.content_length();
+    let mut downloaded = 0u64;
+    let mut body = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|err| http_err(url, err.to_string()))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        downloaded += chunk.len() as u64;
+        body.extend_from_slice(&chunk);
+        on_progress(downloaded, total);
+    }
+    Ok(body)
+}
+
+struct TransferProgress {
+    label: String,
+    total: Option<u64>,
+    downloaded: u64,
+    started: Instant,
+    bar: Option<ProgressBar>,
+    finished: bool,
+}
+
+impl TransferProgress {
+    fn start(ui: DownloadUi, label: &str, total: Option<u64>) -> Self {
+        let bar = if ui == DownloadUi::Bar && !ProgressDrawTarget::stderr().is_hidden() {
+            Some(make_bar(label, total))
+        } else {
+            None
+        };
+        Self {
+            label: label.to_string(),
+            total,
+            downloaded: 0,
+            started: Instant::now(),
+            bar,
+            finished: false,
+        }
+    }
+
+    fn set_downloaded(&mut self, downloaded: u64) {
+        self.downloaded = downloaded;
+        if let Some(bar) = &self.bar {
+            bar.set_position(downloaded);
+        }
+    }
+
+    fn finish_ok(&mut self) {
+        self.finished = true;
+        if let Some(bar) = &self.bar {
+            bar.set_position(self.downloaded);
+            bar.finish();
+            return;
+        }
+        eprint!(
+            "{}",
+            format_transferred(
+                &self.label,
+                self.downloaded,
+                self.total,
+                self.started.elapsed()
+            )
+        );
+    }
+}
+
+impl Drop for TransferProgress {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
+
+fn make_bar(label: &str, total: Option<u64>) -> ProgressBar {
+    let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::stderr());
+    let template = if total.is_some() {
+        "{msg} [{bar:32}] {bytes}/{total_bytes} {bytes_per_sec}"
+    } else {
+        "{msg} {bytes} {bytes_per_sec}"
+    };
+    let style = ProgressStyle::with_template(template)
+        .expect("进度条模板")
+        .progress_chars("=>-");
+    bar.set_style(style);
+    bar.set_message(format!("下载 {label}"));
+    bar.enable_steady_tick(Duration::from_millis(120));
+    bar
 }
 
 /// 先校验 SHA256，再在临时目录解压。路径里出现 `..` 或绝对路径时拒绝写入。
@@ -464,7 +621,9 @@ mod tests {
     use flate2::Compression;
     use std::fs;
     use std::io::Write;
+    use std::time::Duration;
     use tar::Builder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn platform() -> Platform {
         Platform {
@@ -509,6 +668,143 @@ mod tests {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&tar_bytes).unwrap();
         encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn quiet_or_non_tty_uses_one_transferred_line() {
+        assert_eq!(download_ui(true, true, Some("xterm")), DownloadUi::Plain);
+        assert_eq!(download_ui(false, false, Some("xterm")), DownloadUi::Plain);
+        assert_eq!(download_ui(false, true, Some("dumb")), DownloadUi::Plain);
+        assert_eq!(download_ui(false, true, None), DownloadUi::Bar);
+        assert_eq!(download_ui(false, true, Some("xterm")), DownloadUi::Bar);
+        assert_eq!(
+            format_transferred("go.tar.gz", 100, Some(200), Duration::from_secs(2)),
+            "已传输 go.tar.gz 100/200 字节（50 字节/秒）\n"
+        );
+        assert_eq!(
+            format_transferred("go.tar.gz", 100, None, Duration::ZERO),
+            "已传输 go.tar.gz 100 字节\n"
+        );
+        assert_eq!(
+            format_transferred("go.tar.gz", 0, Some(0), Duration::from_secs(1)),
+            "已传输 go.tar.gz 0/0 字节\n"
+        );
+    }
+
+    #[test]
+    fn progress_bar_templates_accept_updates() {
+        let known = make_bar("go.tar.gz", Some(4));
+        known.set_position(4);
+        known.finish_and_clear();
+        let unknown = make_bar("go.tar.gz", None);
+        unknown.set_position(4);
+        unknown.finish_and_clear();
+    }
+
+    #[tokio::test]
+    async fn archive_download_reports_bytes_from_local_server() {
+        let body = b"hello-archive-bytes-0123456789";
+        let addr = serve_once("200 OK", true, body).await;
+        let url = format!("http://{addr}/go1.2.3.linux-amd64.tar.gz");
+        let mut updates = Vec::new();
+        let response = send_get(&url).await.unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_chunks(&url, response, |downloaded, total| {
+                updates.push((downloaded, total));
+            }),
+        )
+        .await
+        .expect("download timed out")
+        .unwrap();
+        assert_eq!(bytes, body);
+        assert!(!updates.is_empty());
+        let mut previous = 0u64;
+        for (downloaded, total) in &updates {
+            assert!(*downloaded >= previous);
+            assert_eq!(*total, Some(body.len() as u64));
+            previous = *downloaded;
+        }
+        assert_eq!(previous, body.len() as u64);
+
+        let addr = serve_once("200 OK", false, body).await;
+        let url = format!("http://{addr}/go.tar.gz");
+        let response = send_get(&url).await.unwrap();
+        let mut updates = Vec::new();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_chunks(&url, response, |downloaded, total| {
+                updates.push((downloaded, total));
+            }),
+        )
+        .await
+        .expect("download timed out")
+        .unwrap();
+        assert_eq!(bytes, body);
+        assert!(updates.iter().all(|(_, total)| total.is_none()));
+        assert_eq!(updates.last().map(|item| item.0), Some(body.len() as u64));
+
+        let addr = serve_once("200 OK", true, body).await;
+        let url = format!("http://{addr}/go.tar.gz");
+        let archived = tokio::time::timeout(
+            Duration::from_secs(5),
+            download_archive(&url, "go.tar.gz", DownloadUi::Plain),
+        )
+        .await
+        .expect("plain download timed out")
+        .unwrap();
+        assert_eq!(archived, body);
+
+        let addr = serve_once("500 Internal Server Error", true, b"nope").await;
+        let url = format!("http://{addr}/missing.tar.gz");
+        let mut called = false;
+        let err = tokio::time::timeout(Duration::from_secs(5), async {
+            let response = send_get(&url).await?;
+            read_chunks(&url, response, |_, _| called = true).await
+        })
+        .await
+        .expect("status check timed out")
+        .unwrap_err();
+        assert!(!called);
+        assert!(
+            matches!(err, Error::Http { ref message, .. } if message.starts_with("HTTP 500")),
+            "{err}"
+        );
+    }
+
+    async fn serve_once(status: &str, content_length: bool, body: &[u8]) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_vec();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let Ok(n) = socket.read(&mut tmp).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let mut header = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            if content_length {
+                header.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            }
+            header.push_str("\r\n");
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        addr
     }
 
     #[test]
