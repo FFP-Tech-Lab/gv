@@ -226,6 +226,104 @@ fn uninstall_blocks_on_global_pin_until_force() {
 }
 
 #[test]
+fn uninstall_removes_each_given_version() {
+    let root = TempDir::new();
+    install_fake_sdk(root.path(), "1.22.5");
+    install_fake_sdk(root.path(), "1.23.4");
+
+    let output = gv(root.path())
+        .args(["uninstall", "1.22.5", "go1.23.4"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "已卸载 Go 1.22.5\n已卸载 Go 1.23.4\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!root.path().join("versions/1.22.5").exists());
+    assert!(!root.path().join("versions/1.23.4").exists());
+}
+
+#[test]
+fn uninstall_continues_after_failure_and_notices_missing_versions() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    install_fake_sdk(root.path(), "1.22.5");
+    install_fake_sdk(root.path(), "1.23.4");
+    install_fake_sdk(root.path(), "1.21.0");
+    let use_global = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["use", "--global", "1.23.4"])
+        .output()
+        .unwrap();
+    assert!(
+        use_global.status.success(),
+        "{}",
+        String::from_utf8_lossy(&use_global.stderr)
+    );
+
+    let output = gv(root.path())
+        .args(["uninstall", "1.22.5", "1.23", "9.9.9", "1.23.4", "1.21.0"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "已卸载 Go 1.22.5\nGo 9.9.9 未安装\n已卸载 Go 1.21.0\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "gv: Go 1.23 卸载失败：请指定完整版本号，不能只写 1.23\n\
+         gv: Go 1.23.4 卸载失败：全局版本正指向 1.23.4。如需卸载请运行 gv uninstall 1.23.4 --force\n"
+    );
+    assert!(!root.path().join("versions/1.22.5").exists());
+    assert!(root.path().join("versions/1.23.4/go/bin/go").is_file());
+    assert!(!root.path().join("versions/1.21.0").exists());
+    assert!(root.path().join("version").is_file());
+}
+
+#[test]
+fn uninstall_force_clears_global_pin_among_several_versions() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    install_fake_sdk(root.path(), "1.22.5");
+    install_fake_sdk(root.path(), "1.23.4");
+    let use_global = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["use", "--global", "1.23.4"])
+        .output()
+        .unwrap();
+    assert!(
+        use_global.status.success(),
+        "{}",
+        String::from_utf8_lossy(&use_global.stderr)
+    );
+
+    let output = gv(root.path())
+        .args(["uninstall", "--force", "1.22.5", "1.23.4"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "已卸载 Go 1.22.5\n已卸载 Go 1.23.4，并清除全局版本\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(!root.path().join("versions/1.22.5").exists());
+    assert!(!root.path().join("versions/1.23.4").exists());
+    assert!(!root.path().join("version").exists());
+}
+
+#[test]
 fn already_installed_does_not_contact_the_network() {
     let root = TempDir::new();
     install_fake_sdk(root.path(), "1.2.3");

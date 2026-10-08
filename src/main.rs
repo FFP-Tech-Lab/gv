@@ -26,7 +26,7 @@ use crate::error::Error;
     about = "Go 版本管理器",
     subcommand_required = true,
     arg_required_else_help = true,
-    after_long_help = "示例：\n  gv install 1.23.4\n  gv install 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --global 1.23.4\n  eval \"$(gv init bash)\""
+    after_long_help = "示例：\n  gv install 1.23.4\n  gv install 1.22.5 1.23.4\n  gv uninstall 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --global 1.23.4\n  eval \"$(gv init bash)\""
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,12 +44,14 @@ enum Command {
         #[arg(required = true, value_name = "VERSION")]
         versions: Vec<String>,
     },
-    /// 卸载指定的 Go 版本
+    /// 卸载一个或多个 Go 版本
     Uninstall {
-        version: String,
-        /// 全局版本指向该版本时仍卸载，并清除全局版本文件
+        /// 全局版本指向待卸载版本时仍卸载，并清除全局版本文件
         #[arg(long)]
         force: bool,
+        /// 版本号，可一次传入多个
+        #[arg(required = true, value_name = "VERSION")]
+        versions: Vec<String>,
     },
     /// 列出已安装的版本
     List,
@@ -102,8 +104,8 @@ fn run() -> Result<(), Error> {
         Command::Install { versions, quiet } => {
             block_on(commands::install::run(&root, &versions, quiet))?
         }
-        Command::Uninstall { version, force } => {
-            println!("{}", commands::uninstall::run(&root, &version, force)?);
+        Command::Uninstall { versions, force } => {
+            commands::uninstall::run(&root, &versions, force)?;
         }
         Command::List => {
             let cwd = env::current_dir()?;

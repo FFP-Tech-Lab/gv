@@ -66,7 +66,7 @@ export PATH="$GV_ROOT/shims:$GV_ROOT/bin:$PATH"
 | 命令 | 作用 |
 | --- | --- |
 | `gv install <version> [version...]` | 查索引、下载、校验 SHA256、解压。一次传入多个版本时同时下载。已安装的版本会跳过并说明。终端里每个正在下载的版本各有一条进度条；`--quiet`、非终端或 `TERM=dumb` 时，每个版本只在结束时打印一行已传输字节数。某个版本失败时，其余版本仍会装完，并逐条打印失败原因，最后以非零状态退出 |
-| `gv uninstall <version>` | 删除该 SDK。全局文件正指向它时拒绝，除非 `--force`（同时清掉全局文件） |
+| `gv uninstall <version> [version...]` | 按顺序删除这些 SDK。未安装的版本会逐个说明并继续。全局文件正指向其中某个版本时拒绝该版本，除非 `--force`（作用于整条命令，同时清掉全局文件）。某个版本失败时，其余版本仍会继续卸载，逐条打印失败原因，并以非零状态退出 |
 | `gv list` | 列出已安装版本，并用 `*` 标出当前解析结果 |
 | `gv list-remote` | 列出 stable 版本。`--all` 含 beta、rc 等历史版本。`--refresh` 强制刷新索引 |
 | `gv use <version>` | 写入当前目录的 `.go-version` |
