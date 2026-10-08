@@ -65,6 +65,9 @@ pub enum Error {
     #[error("下载失败 {url}：{message}")]
     Http { url: String, message: String },
 
+    #[error("{0}")]
+    Failed(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

@@ -26,7 +26,7 @@ use crate::error::Error;
     about = "Go 版本管理器",
     subcommand_required = true,
     arg_required_else_help = true,
-    after_long_help = "示例：\n  gv install 1.23.4\n  gv use 1.23.4\n  gv use --global 1.23.4\n  eval \"$(gv init bash)\""
+    after_long_help = "示例：\n  gv install 1.23.4\n  gv install 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --global 1.23.4\n  eval \"$(gv init bash)\""
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,12 +35,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 下载并安装指定的 Go 版本
+    /// 下载并安装一个或多个 Go 版本
     Install {
-        version: String,
-        /// 不绘制进度条，结束时只打印一行已传输字节数
+        /// 不绘制进度条，每个版本结束时只打印一行已传输字节数
         #[arg(short, long)]
         quiet: bool,
+        /// 版本号，可一次传入多个
+        #[arg(required = true, value_name = "VERSION")]
+        versions: Vec<String>,
     },
     /// 卸载指定的 Go 版本
     Uninstall {
@@ -78,7 +80,9 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("gv: {err}");
+            for line in err.to_string().lines() {
+                eprintln!("gv: {line}");
+            }
             ExitCode::from(1)
         }
     }
@@ -95,8 +99,8 @@ fn run() -> Result<(), Error> {
     shim::install_shims(&root)?;
 
     match cli.command {
-        Command::Install { version, quiet } => {
-            block_on(commands::install::run(&root, &version, quiet))?
+        Command::Install { versions, quiet } => {
+            block_on(commands::install::run(&root, &versions, quiet))?
         }
         Command::Uninstall { version, force } => {
             println!("{}", commands::uninstall::run(&root, &version, force)?);
