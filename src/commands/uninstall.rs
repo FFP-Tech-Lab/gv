@@ -5,7 +5,28 @@ use crate::error::Error;
 use crate::resolve::{self, Version, VersionQuery};
 use crate::store;
 
-pub fn run(root: &Path, requested: &str, force: bool) -> Result<String, Error> {
+pub fn run(root: &Path, requested: &[String], force: bool) -> Result<(), Error> {
+    if requested.len() == 1 {
+        println!("{}", uninstall_one(root, &requested[0], force)?);
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for spec in requested {
+        match uninstall_one(root, spec, force) {
+            Ok(message) => println!("{message}"),
+            Err(Error::NotInstalled(name)) => println!("Go {name} 未安装"),
+            Err(err) => failures.push(format!("Go {spec} 卸载失败：{err}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Failed(failures.join("\n")))
+    }
+}
+
+fn uninstall_one(root: &Path, requested: &str, force: bool) -> Result<String, Error> {
     let version = resolve::require_exact(requested)?;
     let name = version.to_string();
     if !store::tool_exists(root, &name, "go") {
@@ -56,16 +77,16 @@ mod tests {
         touch_sdk(root.path(), "1.22.0");
         fs::write(root.path().join("version"), "go1.23.4\n").unwrap();
 
-        let err = run(root.path(), "1.23.4", false).unwrap_err();
+        let err = uninstall_one(root.path(), "1.23.4", false).unwrap_err();
         assert!(err.to_string().contains("gv uninstall 1.23.4 --force"));
         assert!(store::tool_exists(root.path(), "1.23.4", "go"));
 
-        let message = run(root.path(), "1.22.0", false).unwrap();
+        let message = uninstall_one(root.path(), "1.22.0", false).unwrap();
         assert_eq!(message, "已卸载 Go 1.22.0");
         assert!(!store::tool_exists(root.path(), "1.22.0", "go"));
         assert!(store::tool_exists(root.path(), "1.23.4", "go"));
 
-        let forced = run(root.path(), "1.23.4", true).unwrap();
+        let forced = uninstall_one(root.path(), "1.23.4", true).unwrap();
         assert_eq!(forced, "已卸载 Go 1.23.4，并清除全局版本");
         assert!(!root.path().join("version").exists());
         assert!(!store::version_dir(root.path(), "1.23.4").exists());
@@ -76,8 +97,99 @@ mod tests {
         let root = TempDir::new();
         touch_sdk(root.path(), "1.23.4");
         assert!(matches!(
-            run(root.path(), "1.23", false),
+            uninstall_one(root.path(), "1.23", false),
             Err(Error::NeedExactVersion(_))
         ));
+        assert!(matches!(
+            run(root.path(), &["1.23".to_string()], false),
+            Err(Error::NeedExactVersion(_))
+        ));
+    }
+
+    #[test]
+    fn one_version_still_returns_the_original_error() {
+        let root = TempDir::new();
+        touch_sdk(root.path(), "1.23.4");
+        fs::write(root.path().join("version"), "1.23.4\n").unwrap();
+
+        let err = run(root.path(), &["1.23.4".to_string()], false).unwrap_err();
+        assert!(matches!(err, Error::UninstallBlocked(_)));
+        assert!(store::tool_exists(root.path(), "1.23.4", "go"));
+    }
+
+    #[test]
+    fn missing_versions_do_not_stop_the_batch() {
+        let root = TempDir::new();
+        touch_sdk(root.path(), "1.22.5");
+
+        run(
+            root.path(),
+            &[
+                "9.9.9".to_string(),
+                "1.22.5".to_string(),
+                "8.8.8".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(!store::tool_exists(root.path(), "1.22.5", "go"));
+    }
+
+    #[test]
+    fn continues_after_failure_and_keeps_later_versions_moving() {
+        let root = TempDir::new();
+        touch_sdk(root.path(), "1.22.5");
+        touch_sdk(root.path(), "1.23.4");
+        touch_sdk(root.path(), "1.21.0");
+        fs::write(root.path().join("version"), "go1.23.4\n").unwrap();
+
+        let err = run(
+            root.path(),
+            &[
+                "1.22.5".to_string(),
+                "1.23".to_string(),
+                "9.9.9".to_string(),
+                "1.23.4".to_string(),
+                "1.21.0".to_string(),
+            ],
+            false,
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("Go 1.23 卸载失败"));
+        assert!(text.contains("不能只写 1.23"));
+        assert!(text.contains("gv uninstall 1.23.4 --force"));
+        assert!(!text.contains("9.9.9"));
+        assert!(!store::tool_exists(root.path(), "1.22.5", "go"));
+        assert!(store::tool_exists(root.path(), "1.23.4", "go"));
+        assert!(!store::tool_exists(root.path(), "1.21.0", "go"));
+        assert_eq!(
+            fs::read_to_string(root.path().join("version")).unwrap(),
+            "go1.23.4\n"
+        );
+    }
+
+    #[test]
+    fn force_clears_global_when_it_points_at_one_version() {
+        let root = TempDir::new();
+        touch_sdk(root.path(), "1.22.5");
+        touch_sdk(root.path(), "1.23.4");
+        touch_sdk(root.path(), "1.21.0");
+        fs::write(root.path().join("version"), "go1.23.4\n").unwrap();
+
+        run(
+            root.path(),
+            &[
+                "1.22.5".to_string(),
+                "1.23.4".to_string(),
+                "1.21.0".to_string(),
+            ],
+            true,
+        )
+        .unwrap();
+        assert!(!store::tool_exists(root.path(), "1.22.5", "go"));
+        assert!(!store::version_dir(root.path(), "1.23.4").exists());
+        assert!(!store::tool_exists(root.path(), "1.21.0", "go"));
+        assert!(!root.path().join("version").exists());
     }
 }
