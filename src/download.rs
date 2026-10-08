@@ -1,11 +1,11 @@
 use std::fs;
-use std::io::{self, Cursor, IsTerminal};
+use std::io::{self, Cursor, IsTerminal, Write};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::{Archive, EntryType};
@@ -347,6 +347,152 @@ pub async fn download_archive(url: &str, label: &str, ui: DownloadUi) -> Result<
     Ok(bytes)
 }
 
+async fn download_archive_bar(url: &str, label: &str, bar: &ProgressBar) -> Result<Vec<u8>, Error> {
+    let response = match send_get(url).await {
+        Ok(response) => response,
+        Err(err) => {
+            bar.finish_and_clear();
+            return Err(err);
+        }
+    };
+    let total = response.content_length();
+    if let Some(len) = total {
+        bar.set_length(len);
+        bar.set_style(progress_style(Some(len)));
+        bar.set_message(format!("下载 {label}"));
+    }
+    let mut progress = TransferProgress::from_bar(label, total, bar.clone());
+    let bytes = read_chunks(url, response, |downloaded, _| {
+        progress.set_downloaded(downloaded);
+    })
+    .await?;
+    progress.finish_ok();
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressRender {
+    SingleBar,
+    Multi,
+    Plain,
+}
+
+fn progress_render(count: usize, ui: DownloadUi, stderr_hidden: bool) -> ProgressRender {
+    if ui != DownloadUi::Bar || stderr_hidden {
+        ProgressRender::Plain
+    } else if count > 1 {
+        ProgressRender::Multi
+    } else {
+        ProgressRender::SingleBar
+    }
+}
+
+/// 下载并安装多个计划。多于一个且终端可绘制时，每个版本一条进度条；否则各自打印一行已传输字节数。
+/// 某个版本失败不会取消其余版本。
+pub async fn install_plans(
+    plans: Vec<InstallPlan>,
+    ui: DownloadUi,
+    versions_dir: &Path,
+) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
+    if plans.len() <= 1 {
+        return install_plans_sequential(plans, ui, versions_dir).await;
+    }
+    let render = progress_render(plans.len(), ui, ProgressDrawTarget::stderr().is_hidden());
+    match render {
+        ProgressRender::Multi => {
+            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
+            install_plans_concurrent(plans, Some(multi), versions_dir).await
+        }
+        ProgressRender::Plain | ProgressRender::SingleBar => {
+            install_plans_concurrent(plans, None, versions_dir).await
+        }
+    }
+}
+
+async fn install_plans_sequential(
+    plans: Vec<InstallPlan>,
+    ui: DownloadUi,
+    versions_dir: &Path,
+) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
+    let mut results = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let version = plan.version.to_string();
+        match download_and_install(plan, ui, versions_dir).await {
+            Ok(status) => results.push(Ok((version, status))),
+            Err(err) => results.push(Err((version, err))),
+        }
+    }
+    results
+}
+
+async fn install_plans_concurrent(
+    plans: Vec<InstallPlan>,
+    multi: Option<MultiProgress>,
+    versions_dir: &Path,
+) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
+    // 父任务持有每条进度条到全部下载结束。先完成的条如果被丢掉，
+    // 其他条刷新时会把它从屏幕上清掉。
+    let bars: Vec<Option<ProgressBar>> = match &multi {
+        Some(multi) => plans
+            .iter()
+            .map(|plan| {
+                let bar = multi.add(ProgressBar::no_length());
+                style_bar(&bar, &plan.filename, None);
+                Some(bar)
+            })
+            .collect(),
+        None => (0..plans.len()).map(|_| None).collect(),
+    };
+
+    let mut jobs = Vec::with_capacity(plans.len());
+    for (index, plan) in plans.into_iter().enumerate() {
+        let versions_dir = versions_dir.to_path_buf();
+        let bar = bars[index].clone();
+        let version = plan.version.to_string();
+        let handle = tokio::spawn(async move {
+            if let Some(bar) = bar {
+                download_and_install_bar(plan, &bar, &versions_dir).await
+            } else {
+                download_and_install(plan, DownloadUi::Plain, &versions_dir).await
+            }
+        });
+        jobs.push((index, version, handle));
+    }
+
+    let mut finished = Vec::with_capacity(jobs.len());
+    for (index, version, handle) in jobs {
+        let result = match handle.await {
+            Ok(Ok(status)) => Ok((version, status)),
+            Ok(Err(err)) => Err((version, err)),
+            Err(err) => Err((version, Error::Failed(format!("安装任务中断：{err}")))),
+        };
+        finished.push((index, result));
+    }
+    drop(bars);
+    finished.sort_by_key(|(index, _)| *index);
+    finished.into_iter().map(|(_, result)| result).collect()
+}
+
+async fn download_and_install(
+    plan: InstallPlan,
+    ui: DownloadUi,
+    versions_dir: &Path,
+) -> Result<InstallStatus, Error> {
+    let version = plan.version.to_string();
+    let bytes = download_archive(&plan.url, &plan.filename, ui).await?;
+    install_verified_archive(&bytes, &plan.sha256, versions_dir, &version)
+}
+
+async fn download_and_install_bar(
+    plan: InstallPlan,
+    bar: &ProgressBar,
+    versions_dir: &Path,
+) -> Result<InstallStatus, Error> {
+    let version = plan.version.to_string();
+    let bytes = download_archive_bar(&plan.url, &plan.filename, bar).await?;
+    install_verified_archive(&bytes, &plan.sha256, versions_dir, &version)
+}
+
 fn http_err(url: &str, message: impl Into<String>) -> Error {
     Error::Http {
         url: url.to_string(),
@@ -429,6 +575,17 @@ impl TransferProgress {
         }
     }
 
+    fn from_bar(label: &str, total: Option<u64>, bar: ProgressBar) -> Self {
+        Self {
+            label: label.to_string(),
+            total,
+            downloaded: 0,
+            started: Instant::now(),
+            bar: Some(bar),
+            finished: false,
+        }
+    }
+
     fn finish_ok(&mut self) {
         self.finished = true;
         if let Some(bar) = &self.bar {
@@ -436,15 +593,14 @@ impl TransferProgress {
             bar.finish();
             return;
         }
-        eprint!(
-            "{}",
-            format_transferred(
-                &self.label,
-                self.downloaded,
-                self.total,
-                self.started.elapsed()
-            )
+        let line = format_transferred(
+            &self.label,
+            self.downloaded,
+            self.total,
+            self.started.elapsed(),
         );
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(line.as_bytes());
     }
 }
 
@@ -459,19 +615,26 @@ impl Drop for TransferProgress {
     }
 }
 
-fn make_bar(label: &str, total: Option<u64>) -> ProgressBar {
-    let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::stderr());
+fn progress_style(total: Option<u64>) -> ProgressStyle {
     let template = if total.is_some() {
         "{msg} [{bar:32}] {bytes}/{total_bytes} {bytes_per_sec}"
     } else {
         "{msg} {bytes} {bytes_per_sec}"
     };
-    let style = ProgressStyle::with_template(template)
+    ProgressStyle::with_template(template)
         .expect("进度条模板")
-        .progress_chars("=>-");
-    bar.set_style(style);
+        .progress_chars("=>-")
+}
+
+fn style_bar(bar: &ProgressBar, label: &str, total: Option<u64>) {
+    bar.set_style(progress_style(total));
     bar.set_message(format!("下载 {label}"));
     bar.enable_steady_tick(Duration::from_millis(120));
+}
+
+fn make_bar(label: &str, total: Option<u64>) -> ProgressBar {
+    let bar = ProgressBar::with_draw_target(total, ProgressDrawTarget::stderr());
+    style_bar(&bar, label, total);
     bar
 }
 
@@ -619,8 +782,11 @@ mod tests {
     use crate::testutil::TempDir;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use indicatif::{MultiProgress, ProgressDrawTarget};
     use std::fs;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tar::Builder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -677,6 +843,22 @@ mod tests {
         assert_eq!(download_ui(false, true, Some("dumb")), DownloadUi::Plain);
         assert_eq!(download_ui(false, true, None), DownloadUi::Bar);
         assert_eq!(download_ui(false, true, Some("xterm")), DownloadUi::Bar);
+        assert_eq!(
+            progress_render(2, DownloadUi::Bar, false),
+            ProgressRender::Multi
+        );
+        assert_eq!(
+            progress_render(1, DownloadUi::Bar, false),
+            ProgressRender::SingleBar
+        );
+        assert_eq!(
+            progress_render(2, DownloadUi::Bar, true),
+            ProgressRender::Plain
+        );
+        assert_eq!(
+            progress_render(2, DownloadUi::Plain, false),
+            ProgressRender::Plain
+        );
         assert_eq!(
             format_transferred("go.tar.gz", 100, Some(200), Duration::from_secs(2)),
             "已传输 go.tar.gz 100/200 字节（50 字节/秒）\n"
@@ -770,6 +952,159 @@ mod tests {
             matches!(err, Error::Http { ref message, .. } if message.starts_with("HTTP 500")),
             "{err}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installs_multiple_versions_concurrently_without_network() {
+        let root = TempDir::new();
+        let left = gz_tar(&[("go/bin/go", b"left-sdk")]);
+        let right = gz_tar(&[("go/bin/go", b"right-sdk")]);
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let left_addr = serve_when_all_arrived(&left, Arc::clone(&arrived), 2).await;
+        let right_addr = serve_when_all_arrived(&right, Arc::clone(&arrived), 2).await;
+        let plans = vec![
+            plan_for(
+                "1.22.5",
+                &left,
+                &format!("http://{left_addr}/go1.22.5.tar.gz"),
+            ),
+            plan_for(
+                "1.23.4",
+                &right,
+                &format!("http://{right_addr}/go1.23.4.tar.gz"),
+            ),
+        ];
+        let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
+        let versions = root.path().join("versions");
+        let results = tokio::time::timeout(
+            Duration::from_secs(8),
+            install_plans_concurrent(plans, Some(multi), &versions),
+        )
+        .await
+        .expect("concurrent install timed out");
+
+        assert_eq!(arrived.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(results[0], Ok((ref version, InstallStatus::Installed)) if version == "1.22.5"),
+            "{results:?}"
+        );
+        assert!(
+            matches!(results[1], Ok((ref version, InstallStatus::Installed)) if version == "1.23.4"),
+            "{results:?}"
+        );
+        assert_eq!(
+            fs::read(versions.join("1.22.5/go/bin/go")).unwrap(),
+            b"left-sdk"
+        );
+        assert_eq!(
+            fs::read(versions.join("1.23.4/go/bin/go")).unwrap(),
+            b"right-sdk"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_install_finishes_successes_when_one_checksum_fails() {
+        let root = TempDir::new();
+        let good = gz_tar(&[("go/bin/go", b"good-sdk")]);
+        let bad = b"not-an-archive".to_vec();
+        let arrived = Arc::new(AtomicUsize::new(0));
+        let good_addr = serve_when_all_arrived(&good, Arc::clone(&arrived), 2).await;
+        let bad_addr = serve_when_all_arrived(&bad, Arc::clone(&arrived), 2).await;
+        let plans = vec![
+            plan_for(
+                "1.22.5",
+                b"checksum-does-not-match-body",
+                &format!("http://{bad_addr}/bad.tar.gz"),
+            ),
+            plan_for(
+                "1.23.4",
+                &good,
+                &format!("http://{good_addr}/go1.23.4.tar.gz"),
+            ),
+        ];
+        let versions = root.path().join("versions");
+        let results = tokio::time::timeout(
+            Duration::from_secs(8),
+            install_plans(plans, DownloadUi::Plain, &versions),
+        )
+        .await
+        .expect("concurrent install timed out");
+
+        assert_eq!(arrived.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(results[0], Err((ref version, Error::Checksum { .. })) if version == "1.22.5"),
+            "{results:?}"
+        );
+        assert!(
+            matches!(results[1], Ok((ref version, InstallStatus::Installed)) if version == "1.23.4"),
+            "{results:?}"
+        );
+        assert!(!versions.join("1.22.5").exists());
+        assert_eq!(
+            fs::read(versions.join("1.23.4/go/bin/go")).unwrap(),
+            b"good-sdk"
+        );
+    }
+
+    fn plan_for(version: &str, bytes: &[u8], url: &str) -> InstallPlan {
+        InstallPlan {
+            version: resolve::parse_release_version(&format!("go{version}")).unwrap(),
+            filename: format!("go{version}.linux-amd64.tar.gz"),
+            sha256: sha256_hex(bytes),
+            url: url.to_string(),
+        }
+    }
+
+    async fn serve_when_all_arrived(
+        body: &[u8],
+        arrived: Arc<AtomicUsize>,
+        expected: usize,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_vec();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            if read_http_headers(&mut socket).await.is_err() {
+                return;
+            }
+            arrived.fetch_add(1, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            while arrived.load(Ordering::SeqCst) < expected {
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        });
+        addr
+    }
+
+    async fn read_http_headers(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = socket.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn serve_once(status: &str, content_length: bool, body: &[u8]) -> std::net::SocketAddr {
