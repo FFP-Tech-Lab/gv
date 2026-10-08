@@ -6,7 +6,7 @@ use crate::platform::Platform;
 use crate::resolve::{self, VersionQuery};
 use crate::store;
 
-pub async fn run(root: &Path, requested: &str) -> Result<(), Error> {
+pub async fn run(root: &Path, requested: &str, quiet: bool) -> Result<(), Error> {
     let query = resolve::parse_user_spec(requested)?;
     if let VersionQuery::Exact(version) = &query {
         if store::tool_exists(root, &version.to_string(), "go") {
@@ -34,7 +34,9 @@ pub async fn run(root: &Path, requested: &str) -> Result<(), Error> {
         return Ok(());
     }
 
-    let bytes = download::http_get(&plan.url).await?;
+    let bytes =
+        download::download_archive(&plan.url, &plan.filename, download::download_ui_for(quiet))
+            .await?;
     match download::install_verified_archive(
         &bytes,
         &plan.sha256,
