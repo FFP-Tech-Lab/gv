@@ -1,0 +1,138 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "rust-toolchain.toml has no channel" >&2
+            exit 1
+          fi
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+
+      - name: Check tag
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "gv") | .version')
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "could not read the gv version" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+
+  build:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: gv-linux-amd64.tar.gz
+            musl: true
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: gv-linux-arm64.tar.gz
+            musl: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            archive: gv-darwin-amd64.tar.gz
+            musl: false
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            archive: gv-darwin-arm64.tar.gz
+            musl: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install musl
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust target
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then
+            echo "rust-toolchain.toml has no channel" >&2
+            exit 1
+          fi
+          rustup toolchain install "$channel" --profile minimal --no-self-update
+          rustup target add --toolchain "$channel" "${{ matrix.target }}"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          archive="${{ matrix.archive }}"
+          COPYFILE_DISABLE=1 tar -C "target/${{ matrix.target }}/release" -czf "$archive" gv
+          members=$(COPYFILE_DISABLE=1 tar -tzf "$archive")
+          if [ "$members" != "gv" ]; then
+            echo "archive member must be gv, got ${members}" >&2
+            exit 1
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: gv-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          for archive in gv-linux-amd64.tar.gz gv-linux-arm64.tar.gz gv-darwin-amd64.tar.gz gv-darwin-arm64.tar.gz; do
+            test -f "$archive"
+          done
+          sha256sum \
+            gv-linux-amd64.tar.gz \
+            gv-linux-arm64.tar.gz \
+            gv-darwin-amd64.tar.gz \
+            gv-darwin-arm64.tar.gz \
+            > SHA256SUMS
+          grep -E '^[0-9a-f]{64}  gv-(linux|darwin)-(amd64|arm64)\.tar\.gz$' SHA256SUMS
+          test "$(wc -l < SHA256SUMS | tr -d ' ')" -eq 4
+
+      - name: Create GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            gv-linux-amd64.tar.gz \
+            gv-linux-arm64.tar.gz \
+            gv-darwin-amd64.tar.gz \
+            gv-darwin-arm64.tar.gz \
+            SHA256SUMS
