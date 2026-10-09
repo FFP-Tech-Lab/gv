@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+# macOS awk mis-compares UTF-8 headings when the locale is en_US.UTF-8.
+export LC_ALL=C
+
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 
 fail() {
