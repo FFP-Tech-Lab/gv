@@ -162,14 +162,6 @@ During a download, a terminal shows transferred bytes, speed, and the estimated 
 
 Paths containing `..`, absolute paths, or unsafe link targets are refused. Only then is the temporary directory atomically renamed to `versions/<version>`. `gv clean` deletes only the archives in `cache/archives/`.
 
-## Not in this version
-
-- Windows
-- fish and PowerShell
-- Automatically editing shell config
-- Selecting a version from the `toolchain` line in `go.mod`
-- Calling a `go` binary already installed on the system
-
 ## Development
 
 ```bash

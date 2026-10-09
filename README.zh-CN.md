@@ -162,14 +162,6 @@ eval "$(gv shell 1.23.4)"
 
 包含 `..` 的路径、绝对路径或不安全的链接目标会被拒绝。通过这些检查之后，临时目录才会原子地重命名为 `versions/<version>`。`gv clean` 只删除 `cache/archives/` 里的压缩包。
 
-## 当前版本不做的事
-
-- Windows
-- fish 与 PowerShell
-- 自动修改 shell 配置
-- 从 `go.mod` 的 `toolchain` 行选择版本
-- 调用系统里已经安装的 `go` 二进制
-
 ## 开发
 
 ```bash
