@@ -395,7 +395,12 @@ fn install_accepts_several_versions_and_skips_each_without_network() {
 
     let missing = gv(root.path()).arg("install").output().unwrap();
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("VERSION"));
+    assert!(missing.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 }
 
 #[test]
@@ -922,5 +927,52 @@ fn clean_removes_archive_cache_only() {
     assert_eq!(
         String::from_utf8(again.stdout).unwrap(),
         "No cached archives\n"
+    );
+}
+
+#[test]
+fn install_and_use_without_a_version_fail_when_output_is_piped() {
+    let root = TempDir::new();
+    let install = gv(root.path()).arg("install").output().unwrap();
+    assert!(!install.status.success());
+    assert!(install.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&install.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let quiet = gv(root.path())
+        .args(["install", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(!quiet.status.success());
+    assert!(quiet.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    let use_cmd = gv(root.path()).arg("use").output().unwrap();
+    assert!(!use_cmd.status.success());
+    assert!(use_cmd.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&use_cmd.stderr).contains("Specify a version, or use --unset"),
+        "{}",
+        String::from_utf8_lossy(&use_cmd.stderr)
+    );
+
+    let dumb = gv(root.path())
+        .env("TERM", "dumb")
+        .arg("use")
+        .output()
+        .unwrap();
+    assert!(!dumb.status.success());
+    assert!(dumb.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&dumb.stderr).contains("Specify a version, or use --unset"),
+        "{}",
+        String::from_utf8_lossy(&dumb.stderr)
     );
 }

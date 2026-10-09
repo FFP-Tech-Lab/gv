@@ -5,29 +5,43 @@ use crate::error::Error;
 use crate::store;
 
 pub fn run(root: &Path) -> Result<String, Error> {
+    let ui = crate::ui::Ui::detect(false);
+    let activity = ui.start("Removing cached archives");
     let dir = store::archive_cache_dir(root);
-    if !dir.is_dir() {
-        return Ok("No cached archives\n".to_string());
-    }
-    let mut removed = 0u64;
-    for entry in fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() && !file_type.is_symlink() {
-            fs::remove_dir_all(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-        removed += 1;
-    }
-    if removed == 0 {
-        Ok("No cached archives\n".to_string())
-    } else if removed == 1 {
-        Ok("Removed 1 cached archive\n".to_string())
+    let text = if !dir.is_dir() {
+        "No cached archives\n".to_string()
     } else {
-        Ok(format!("Removed {removed} cached archives\n"))
-    }
+        let mut removed = 0u64;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+            removed += 1;
+        }
+        if removed == 0 {
+            "No cached archives\n".to_string()
+        } else if removed == 1 {
+            "Removed 1 cached archive\n".to_string()
+        } else {
+            format!("Removed {removed} cached archives\n")
+        }
+    };
+    let tone = if clean_notice(&text) {
+        crate::ui::Tone::Notice
+    } else {
+        crate::ui::Tone::Done
+    };
+    activity.finish(tone, &text);
+    Ok(text)
+}
+
+fn clean_notice(message: &str) -> bool {
+    message.starts_with("No cached archives")
 }
 
 #[cfg(test)]
@@ -65,5 +79,12 @@ mod tests {
         touch_sdk(root.path(), "1.2.3");
         assert_eq!(run(root.path()).unwrap(), "No cached archives\n");
         assert!(store::tool_path(root.path(), "1.2.3", "go").is_file());
+    }
+
+    #[test]
+    fn clean_notice_is_only_the_empty_cache() {
+        assert!(clean_notice("No cached archives\n"));
+        assert!(!clean_notice("Removed 1 cached archive\n"));
+        assert!(!clean_notice("Removed 2 cached archives\n"));
     }
 }
