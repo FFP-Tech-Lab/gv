@@ -82,7 +82,12 @@ fn cmp_pre(left: Option<&Pre>, right: Option<&Pre>) -> Ordering {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionQuery {
     Exact(Version),
-    Minor { major: u64, minor: u64 },
+    Minor {
+        major: u64,
+        minor: u64,
+    },
+    /// 仅用于 `gv install`。不进入版本文件，也不改变 `gv use`。
+    Latest,
 }
 
 impl VersionQuery {
@@ -90,6 +95,7 @@ impl VersionQuery {
         match self {
             Self::Exact(version) => version.to_string(),
             Self::Minor { major, minor } => format!("{major}.{minor}"),
+            Self::Latest => "latest".to_string(),
         }
     }
 }
@@ -105,6 +111,14 @@ pub enum Origin {
 pub struct Resolved {
     pub version: Version,
     pub origin: Origin,
+}
+
+/// `latest` 只在安装时合法。`gv use` 和版本文件仍走 `parse_user_spec`。
+pub fn parse_install_spec(input: &str) -> Result<VersionQuery, Error> {
+    if input.trim().eq_ignore_ascii_case("latest") {
+        return Ok(VersionQuery::Latest);
+    }
+    parse_user_spec(input)
 }
 
 pub fn parse_user_spec(input: &str) -> Result<VersionQuery, Error> {
@@ -129,7 +143,9 @@ pub fn parse_user_spec(input: &str) -> Result<VersionQuery, Error> {
 pub fn parse_release_version(input: &str) -> Result<Version, Error> {
     match parse_user_spec(input)? {
         VersionQuery::Exact(version) => Ok(version),
-        VersionQuery::Minor { .. } => Err(Error::BadVersion(input.to_string())),
+        VersionQuery::Minor { .. } | VersionQuery::Latest => {
+            Err(Error::BadVersion(input.to_string()))
+        }
     }
 }
 
@@ -139,6 +155,7 @@ pub fn require_exact(input: &str) -> Result<Version, Error> {
         VersionQuery::Minor { major, minor } => {
             Err(Error::NeedExactVersion(format!("{major}.{minor}")))
         }
+        VersionQuery::Latest => Err(Error::BadVersion(input.to_string())),
     }
 }
 
@@ -159,6 +176,7 @@ pub fn select_installed(query: &VersionQuery, installed: &[Version]) -> Result<V
             .max()
             .cloned()
             .ok_or_else(|| Error::NotInstalled(format!("{major}.{minor}"))),
+        VersionQuery::Latest => Err(Error::BadVersion("latest".to_string())),
     }
 }
 
@@ -297,7 +315,7 @@ mod tests {
     fn exact(input: &str) -> Version {
         match parse_user_spec(input).unwrap() {
             VersionQuery::Exact(version) => version,
-            VersionQuery::Minor { .. } => panic!("expected exact version"),
+            VersionQuery::Minor { .. } | VersionQuery::Latest => panic!("expected exact version"),
         }
     }
 
@@ -317,6 +335,23 @@ mod tests {
             }
         ));
         assert!(parse_user_spec("1").is_err());
+        assert!(parse_user_spec("latest").is_err());
+        assert!(parse_user_spec("LATEST").is_err());
+        assert!(matches!(
+            parse_install_spec(" latest ").unwrap(),
+            VersionQuery::Latest
+        ));
+        assert!(matches!(
+            parse_install_spec("LATEST").unwrap(),
+            VersionQuery::Latest
+        ));
+        assert!(matches!(
+            parse_install_spec("1.23").unwrap(),
+            VersionQuery::Minor {
+                major: 1,
+                minor: 23
+            }
+        ));
         assert!(parse_user_spec("v1.23.4").is_err());
         assert!(parse_user_spec("1.23.").is_err());
         assert!(parse_user_spec("01.2.3").is_err());

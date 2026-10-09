@@ -1,6 +1,6 @@
 use std::fs;
-use std::io::{self, Cursor, IsTerminal, Write};
-use std::path::{Component, Path};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -74,20 +74,32 @@ struct RawFile {
     kind: String,
 }
 
+#[cfg(test)]
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0xf) as usize] as char);
-    }
-    out
+    hex_encode(&Sha256::digest(bytes))
 }
 
+#[cfg(test)]
 pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), Error> {
+    compare_sha256(sha256_hex(bytes), expected)
+}
+
+pub fn verify_file_sha256(path: &Path, expected: &str) -> Result<(), Error> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    compare_sha256(hex_encode(&hasher.finalize()), expected)
+}
+
+fn compare_sha256(actual: String, expected: &str) -> Result<(), Error> {
     let expected = expected.trim();
-    let actual = sha256_hex(bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(Error::Checksum {
             expected: expected.to_string(),
@@ -95,6 +107,16 @@ pub fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+fn hex_encode(digest: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    out
 }
 
 pub fn archive_url(mirror: &str, filename: &str) -> String {
@@ -138,7 +160,7 @@ pub fn plan_install(
     platform: &Platform,
     mirror: &str,
 ) -> Result<InstallPlan, Error> {
-    let query = resolve::parse_user_spec(requested)?;
+    let query = resolve::parse_install_spec(requested)?;
     let release = select_release(releases, &query)?;
     let file = select_archive(release, platform)?;
     Ok(InstallPlan {
@@ -149,17 +171,40 @@ pub fn plan_install(
     })
 }
 
-pub fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
-    let mut versions: Vec<Version> = releases
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteVersion {
+    pub version: String,
+    pub stable: bool,
+}
+
+pub fn filter_remote_rows(releases: &[Release], all: bool) -> Vec<RemoteVersion> {
+    let mut rows: Vec<(Version, bool)> = releases
         .iter()
         .filter(|release| all || release.stable)
-        .map(|release| release.version.clone())
+        .map(|release| (release.version.clone(), release.stable))
         .collect();
-    versions.sort_by(|left, right| right.cmp(left));
-    versions.dedup();
-    versions
+    rows.sort_by(|left, right| right.0.cmp(&left.0));
+    let mut out = Vec::new();
+    for (version, stable) in rows {
+        let name = version.to_string();
+        if out
+            .last()
+            .is_some_and(|row: &RemoteVersion| row.version == name)
+        {
+            continue;
+        }
+        out.push(RemoteVersion {
+            version: name,
+            stable,
+        });
+    }
+    out
+}
+
+pub fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
+    filter_remote_rows(releases, all)
         .into_iter()
-        .map(|version| version.to_string())
+        .map(|row| row.version)
         .collect()
 }
 
@@ -187,6 +232,11 @@ fn select_release<'a>(releases: &'a [Release], query: &VersionQuery) -> Result<&
             })
             .max_by(|left, right| left.version.cmp(&right.version))
             .ok_or_else(|| Error::VersionNotInIndex(format!("{major}.{minor}"))),
+        VersionQuery::Latest => releases
+            .iter()
+            .filter(|release| release.stable && release.version.is_stable_patch())
+            .max_by(|left, right| left.version.cmp(&right.version))
+            .ok_or_else(|| Error::VersionNotInIndex("latest".to_string())),
     }
 }
 
@@ -335,33 +385,11 @@ pub async fn http_get(url: &str) -> Result<Vec<u8>, Error> {
     read_chunks(url, response, |_, _| {}).await
 }
 
+#[cfg(test)]
 pub async fn download_archive(url: &str, label: &str, ui: DownloadUi) -> Result<Vec<u8>, Error> {
     let response = send_get(url).await?;
     let total = response.content_length();
     let mut progress = TransferProgress::start(ui, label, total);
-    let bytes = read_chunks(url, response, |downloaded, _| {
-        progress.set_downloaded(downloaded);
-    })
-    .await?;
-    progress.finish_ok();
-    Ok(bytes)
-}
-
-async fn download_archive_bar(url: &str, label: &str, bar: &ProgressBar) -> Result<Vec<u8>, Error> {
-    let response = match send_get(url).await {
-        Ok(response) => response,
-        Err(err) => {
-            bar.finish_and_clear();
-            return Err(err);
-        }
-    };
-    let total = response.content_length();
-    if let Some(len) = total {
-        bar.set_length(len);
-        bar.set_style(progress_style(Some(len)));
-        bar.set_message(format!("下载 {label}"));
-    }
-    let mut progress = TransferProgress::from_bar(label, total, bar.clone());
     let bytes = read_chunks(url, response, |downloaded, _| {
         progress.set_downloaded(downloaded);
     })
@@ -388,23 +416,24 @@ fn progress_render(count: usize, ui: DownloadUi, stderr_hidden: bool) -> Progres
 }
 
 /// 下载并安装多个计划。多于一个且终端可绘制时，每个版本一条进度条；否则各自打印一行已传输字节数。
-/// 某个版本失败不会取消其余版本。
+/// 某个版本失败不会取消其余版本。压缩包先落到 `cache_dir`，校验通过后再解压。
 pub async fn install_plans(
     plans: Vec<InstallPlan>,
     ui: DownloadUi,
     versions_dir: &Path,
+    cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     if plans.len() <= 1 {
-        return install_plans_sequential(plans, ui, versions_dir).await;
+        return install_plans_sequential(plans, ui, versions_dir, cache_dir).await;
     }
     let render = progress_render(plans.len(), ui, ProgressDrawTarget::stderr().is_hidden());
     match render {
         ProgressRender::Multi => {
             let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            install_plans_concurrent(plans, Some(multi), versions_dir).await
+            install_plans_concurrent(plans, Some(multi), versions_dir, cache_dir).await
         }
         ProgressRender::Plain | ProgressRender::SingleBar => {
-            install_plans_concurrent(plans, None, versions_dir).await
+            install_plans_concurrent(plans, None, versions_dir, cache_dir).await
         }
     }
 }
@@ -413,11 +442,12 @@ async fn install_plans_sequential(
     plans: Vec<InstallPlan>,
     ui: DownloadUi,
     versions_dir: &Path,
+    cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     let mut results = Vec::with_capacity(plans.len());
     for plan in plans {
         let version = plan.version.to_string();
-        match download_and_install(plan, ui, versions_dir).await {
+        match download_and_install(plan, ui, versions_dir, cache_dir).await {
             Ok(status) => results.push(Ok((version, status))),
             Err(err) => results.push(Err((version, err))),
         }
@@ -429,6 +459,7 @@ async fn install_plans_concurrent(
     plans: Vec<InstallPlan>,
     multi: Option<MultiProgress>,
     versions_dir: &Path,
+    cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     // 父任务持有每条进度条到全部下载结束。先完成的条如果被丢掉，
     // 其他条刷新时会把它从屏幕上清掉。
@@ -447,13 +478,14 @@ async fn install_plans_concurrent(
     let mut jobs = Vec::with_capacity(plans.len());
     for (index, plan) in plans.into_iter().enumerate() {
         let versions_dir = versions_dir.to_path_buf();
+        let cache_dir = cache_dir.to_path_buf();
         let bar = bars[index].clone();
         let version = plan.version.to_string();
         let handle = tokio::spawn(async move {
             if let Some(bar) = bar {
-                download_and_install_bar(plan, &bar, &versions_dir).await
+                download_and_install_bar(plan, &bar, &versions_dir, &cache_dir).await
             } else {
-                download_and_install(plan, DownloadUi::Plain, &versions_dir).await
+                download_and_install(plan, DownloadUi::Plain, &versions_dir, &cache_dir).await
             }
         });
         jobs.push((index, version, handle));
@@ -473,24 +505,156 @@ async fn install_plans_concurrent(
     finished.into_iter().map(|(_, result)| result).collect()
 }
 
+enum DownloadMode<'a> {
+    Plain(DownloadUi),
+    Bar(&'a ProgressBar),
+}
+
 async fn download_and_install(
     plan: InstallPlan,
     ui: DownloadUi,
     versions_dir: &Path,
+    cache_dir: &Path,
 ) -> Result<InstallStatus, Error> {
     let version = plan.version.to_string();
-    let bytes = download_archive(&plan.url, &plan.filename, ui).await?;
-    install_verified_archive(&bytes, &plan.sha256, versions_dir, &version)
+    let path = fetch_cached_archive(&plan, cache_dir, DownloadMode::Plain(ui)).await?;
+    install_archive_file(&path, versions_dir, &version)
 }
 
 async fn download_and_install_bar(
     plan: InstallPlan,
     bar: &ProgressBar,
     versions_dir: &Path,
+    cache_dir: &Path,
 ) -> Result<InstallStatus, Error> {
     let version = plan.version.to_string();
-    let bytes = download_archive_bar(&plan.url, &plan.filename, bar).await?;
-    install_verified_archive(&bytes, &plan.sha256, versions_dir, &version)
+    let path = fetch_cached_archive(&plan, cache_dir, DownloadMode::Bar(bar)).await?;
+    install_archive_file(&path, versions_dir, &version)
+}
+
+fn archive_dest(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
+    if !filename_is_safe(filename) {
+        return Err(Error::UnsafeFilename(filename.to_string()));
+    }
+    Ok(cache_dir.join(filename))
+}
+
+/// 缓存文件存在且校验通过就复用。校验失败则删除该文件；新下载校验失败同样删除。
+async fn fetch_cached_archive(
+    plan: &InstallPlan,
+    cache_dir: &Path,
+    mode: DownloadMode<'_>,
+) -> Result<PathBuf, Error> {
+    let dest = archive_dest(cache_dir, &plan.filename)?;
+    if dest.is_file() && verify_file_sha256(&dest, &plan.sha256).is_ok() {
+        return Ok(dest);
+    }
+    if dest.exists() {
+        fs::remove_file(&dest)?;
+    }
+    let downloaded = match mode {
+        DownloadMode::Plain(ui) => download_archive_to(&plan.url, &plan.filename, ui, &dest).await,
+        DownloadMode::Bar(bar) => {
+            download_archive_bar_to(&plan.url, &plan.filename, bar, &dest).await
+        }
+    };
+    if let Err(err) = downloaded {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
+    }
+    if let Err(err) = verify_file_sha256(&dest, &plan.sha256) {
+        let _ = fs::remove_file(&dest);
+        return Err(err);
+    }
+    Ok(dest)
+}
+
+async fn download_archive_to(
+    url: &str,
+    label: &str,
+    ui: DownloadUi,
+    dest: &Path,
+) -> Result<(), Error> {
+    let response = send_get(url).await?;
+    let total = response.content_length();
+    let mut progress = TransferProgress::start(ui, label, total);
+    write_response_to(url, response, dest, label, &mut progress).await?;
+    progress.finish_ok();
+    Ok(())
+}
+
+async fn download_archive_bar_to(
+    url: &str,
+    label: &str,
+    bar: &ProgressBar,
+    dest: &Path,
+) -> Result<(), Error> {
+    let response = match send_get(url).await {
+        Ok(response) => response,
+        Err(err) => {
+            bar.finish_and_clear();
+            return Err(err);
+        }
+    };
+    let total = response.content_length();
+    if let Some(len) = total {
+        bar.set_length(len);
+        bar.set_style(progress_style(Some(len)));
+        bar.set_message(format!("下载 {label}"));
+    }
+    let mut progress = TransferProgress::from_bar(label, total, bar.clone());
+    write_response_to(url, response, dest, label, &mut progress).await?;
+    progress.finish_ok();
+    Ok(())
+}
+
+async fn write_response_to(
+    url: &str,
+    response: reqwest::Response,
+    dest: &Path,
+    label: &str,
+    progress: &mut TransferProgress,
+) -> Result<(), Error> {
+    let parent = dest
+        .parent()
+        .ok_or_else(|| Error::UnsafeFilename(label.to_string()))?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(
+        ".partial-{label}-{}-{}",
+        std::process::id(),
+        next_nonce()
+    ));
+    let write_result = write_response_tmp(url, response, &tmp, progress).await;
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+async fn write_response_tmp(
+    url: &str,
+    response: reqwest::Response,
+    tmp: &Path,
+    progress: &mut TransferProgress,
+) -> Result<(), Error> {
+    let mut file = fs::File::create(tmp)?;
+    read_chunks_with(
+        url,
+        response,
+        |chunk| {
+            file.write_all(chunk)?;
+            Ok(())
+        },
+        |downloaded, _| progress.set_downloaded(downloaded),
+    )
+    .await?;
+    file.sync_all()?;
+    Ok(())
 }
 
 fn http_err(url: &str, message: impl Into<String>) -> Error {
@@ -521,12 +685,31 @@ async fn send_get(url: &str) -> Result<reqwest::Response, Error> {
 
 async fn read_chunks(
     url: &str,
-    mut response: reqwest::Response,
-    mut on_progress: impl FnMut(u64, Option<u64>),
+    response: reqwest::Response,
+    on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<Vec<u8>, Error> {
+    let mut body = Vec::new();
+    read_chunks_with(
+        url,
+        response,
+        |chunk| {
+            body.extend_from_slice(chunk);
+            Ok(())
+        },
+        on_progress,
+    )
+    .await?;
+    Ok(body)
+}
+
+async fn read_chunks_with(
+    url: &str,
+    mut response: reqwest::Response,
+    mut sink: impl FnMut(&[u8]) -> Result<(), Error>,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<(), Error> {
     let total = response.content_length();
     let mut downloaded = 0u64;
-    let mut body = Vec::new();
     loop {
         let chunk = response
             .chunk()
@@ -535,11 +718,11 @@ async fn read_chunks(
         let Some(chunk) = chunk else {
             break;
         };
+        sink(&chunk)?;
         downloaded += chunk.len() as u64;
-        body.extend_from_slice(&chunk);
         on_progress(downloaded, total);
     }
-    Ok(body)
+    Ok(())
 }
 
 struct TransferProgress {
@@ -639,16 +822,34 @@ fn make_bar(label: &str, total: Option<u64>) -> ProgressBar {
 }
 
 /// 先校验 SHA256，再在临时目录解压。路径里出现 `..` 或绝对路径时拒绝写入。
+#[cfg(test)]
 pub fn install_verified_archive(
     bytes: &[u8],
     expected_sha256: &str,
     versions_dir: &Path,
     version: &str,
 ) -> Result<InstallStatus, Error> {
+    verify_sha256(bytes, expected_sha256)?;
+    install_tree(versions_dir, version, |tmp| extract_tarball(bytes, tmp))
+}
+
+/// 从已经校验过的缓存文件解压。调用方负责 SHA256；校验失败时不要调用本函数。
+pub fn install_archive_file(
+    path: &Path,
+    versions_dir: &Path,
+    version: &str,
+) -> Result<InstallStatus, Error> {
+    install_tree(versions_dir, version, |tmp| extract_tarball_file(path, tmp))
+}
+
+fn install_tree(
+    versions_dir: &Path,
+    version: &str,
+    extract: impl FnOnce(&Path) -> Result<(), Error>,
+) -> Result<InstallStatus, Error> {
     if !version_dir_name_is_safe(version) {
         return Err(Error::BadVersion(version.to_string()));
     }
-    verify_sha256(bytes, expected_sha256)?;
     fs::create_dir_all(versions_dir)?;
     let final_dir = versions_dir.join(version);
     if final_dir.join("go").join("bin").join("go").is_file() {
@@ -667,7 +868,7 @@ pub fn install_verified_archive(
     }
     fs::create_dir_all(&tmp)?;
     let cleanup = RemoveAll(&tmp);
-    extract_tarball(bytes, &tmp)?;
+    extract(&tmp)?;
     if !tmp.join("go").join("bin").join("go").is_file() {
         return Err(Error::BadArchive("压缩包缺少 go/bin/go".into()));
     }
@@ -697,10 +898,20 @@ impl Drop for RemoveAll<'_> {
     }
 }
 
+#[cfg(test)]
 pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<(), Error> {
-    validate_tarball(bytes)?;
+    validate_tarball_reader(std::io::Cursor::new(bytes))?;
+    extract_entries(std::io::Cursor::new(bytes), dest)
+}
+
+fn extract_tarball_file(path: &Path, dest: &Path) -> Result<(), Error> {
+    validate_tarball_reader(BufReader::new(fs::File::open(path)?))?;
+    extract_entries(BufReader::new(fs::File::open(path)?), dest)
+}
+
+fn extract_entries(reader: impl BufRead, dest: &Path) -> Result<(), Error> {
     fs::create_dir_all(dest)?;
-    let decoder = GzDecoder::new(Cursor::new(bytes));
+    let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
     archive.set_preserve_permissions(true);
     for entry in archive
@@ -715,8 +926,8 @@ pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_tarball(bytes: &[u8]) -> Result<(), Error> {
-    let decoder = GzDecoder::new(Cursor::new(bytes));
+fn validate_tarball_reader(reader: impl BufRead) -> Result<(), Error> {
+    let decoder = GzDecoder::new(reader);
     let mut archive = Archive::new(decoder);
     for entry in archive
         .entries()
@@ -976,9 +1187,10 @@ mod tests {
         ];
         let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
         let versions = root.path().join("versions");
+        let cache = root.path().join("archives");
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans_concurrent(plans, Some(multi), &versions),
+            install_plans_concurrent(plans, Some(multi), &versions, &cache),
         )
         .await
         .expect("concurrent install timed out");
@@ -1023,9 +1235,10 @@ mod tests {
             ),
         ];
         let versions = root.path().join("versions");
+        let cache = root.path().join("archives");
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans(plans, DownloadUi::Plain, &versions),
+            install_plans(plans, DownloadUi::Plain, &versions, &cache),
         )
         .await
         .expect("concurrent install timed out");
@@ -1043,6 +1256,72 @@ mod tests {
         assert_eq!(
             fs::read(versions.join("1.23.4/go/bin/go")).unwrap(),
             b"good-sdk"
+        );
+        assert!(!cache.join("go1.22.5.linux-amd64.tar.gz").exists());
+        assert!(cache.join("go1.23.4.linux-amd64.tar.gz").is_file());
+        let leftovers: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".partial-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn reuses_valid_cache_without_contacting_the_server() {
+        let root = TempDir::new();
+        let bytes = gz_tar(&[("go/bin/go", b"cached-sdk")]);
+        let plan = plan_for("1.2.3", &bytes, "http://127.0.0.1:9/go1.2.3.tar.gz");
+        let cache = root.path().join("archives");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(&plan.filename), &bytes).unwrap();
+        let versions = root.path().join("versions");
+        let results = tokio::time::timeout(
+            Duration::from_secs(2),
+            install_plans(vec![plan], DownloadUi::Plain, &versions, &cache),
+        )
+        .await
+        .expect("cached install timed out")
+        .pop()
+        .unwrap();
+        assert!(
+            matches!(results, Ok((ref version, InstallStatus::Installed)) if version == "1.2.3"),
+            "{results:?}"
+        );
+        assert_eq!(
+            fs::read(versions.join("1.2.3/go/bin/go")).unwrap(),
+            b"cached-sdk"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_cache_is_replaced_and_checksum_failure_deletes_the_file() {
+        let root = TempDir::new();
+        let bytes = gz_tar(&[("go/bin/go", b"fresh-sdk")]);
+        let addr = serve_once("200 OK", true, &bytes).await;
+        let plan = plan_for(
+            "1.2.3",
+            &bytes,
+            &format!("http://{addr}/go1.2.3.linux-amd64.tar.gz"),
+        );
+        let cache = root.path().join("archives");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join(&plan.filename), b"corrupt-cache").unwrap();
+        let versions = root.path().join("versions");
+        let results = tokio::time::timeout(
+            Duration::from_secs(5),
+            install_plans(vec![plan.clone()], DownloadUi::Plain, &versions, &cache),
+        )
+        .await
+        .expect("redownload timed out");
+        assert!(
+            matches!(results[0], Ok((ref version, InstallStatus::Installed)) if version == "1.2.3"),
+            "{results:?}"
+        );
+        assert_eq!(fs::read(cache.join(&plan.filename)).unwrap(), bytes);
+        assert_eq!(
+            fs::read(versions.join("1.2.3/go/bin/go")).unwrap(),
+            b"fresh-sdk"
         );
     }
 
@@ -1154,6 +1433,45 @@ mod tests {
     }
 
     #[test]
+    fn latest_selects_highest_stable_patch_only() {
+        let releases = parse_index(
+            r#"[
+              {"version":"go1.22.9","stable":true,"files":[
+                {"filename":"go1.22.9.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"a","kind":"archive"}
+              ]},
+              {"version":"go1.23.10","stable":true,"files":[
+                {"filename":"go1.23.10.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"b","kind":"archive"}
+              ]},
+              {"version":"go1.24.0","stable":true,"files":[
+                {"filename":"go1.24.0.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"c","kind":"archive"}
+              ]},
+              {"version":"go1.25rc1","stable":false,"files":[
+                {"filename":"go1.25rc1.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"d","kind":"archive"}
+              ]},
+              {"version":"go1.24.1rc1","stable":false,"files":[
+                {"filename":"go1.24.1rc1.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"e","kind":"archive"}
+              ]}
+            ]"#,
+        )
+        .unwrap();
+        let plan = plan_install(&releases, "latest", &platform(), "https://go.dev/dl").unwrap();
+        assert_eq!(plan.version.to_string(), "1.24.0");
+        assert_eq!(plan.filename, "go1.24.0.linux-amd64.tar.gz");
+        let upper = plan_install(&releases, "LATEST", &platform(), "https://go.dev/dl").unwrap();
+        assert_eq!(upper.version.to_string(), "1.24.0");
+        let empty = parse_index(
+            r#"[{"version":"go1.25rc1","stable":false,"files":[
+                {"filename":"go1.25rc1.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"d","kind":"archive"}
+            ]}]"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            plan_install(&empty, "latest", &platform(), "https://go.dev/dl").unwrap_err(),
+            Error::VersionNotInIndex(name) if name == "latest"
+        ));
+    }
+
+    #[test]
     fn plans_highest_patch_and_joins_mirror() {
         let releases = sample_index();
         let plan = plan_install(
@@ -1197,6 +1515,16 @@ mod tests {
         let all = filter_remote(&releases, true);
         assert!(all.contains(&"1.23rc1".to_string()));
         assert_eq!(format_remote(&[]), "没有匹配的远端版本\n");
+        let rows = filter_remote_rows(&releases, true);
+        assert!(rows
+            .iter()
+            .any(|row| row.version == "1.23.10" && row.stable));
+        assert!(rows
+            .iter()
+            .any(|row| row.version == "1.23rc1" && !row.stable));
+        assert!(filter_remote_rows(&releases, false)
+            .iter()
+            .all(|row| row.stable));
     }
 
     #[test]
@@ -1283,6 +1611,38 @@ mod tests {
             install_verified_archive(&bytes, &digest, &root.path().join("versions"), "1.2.3")
                 .unwrap();
         assert_eq!(again, InstallStatus::AlreadyPresent);
+    }
+
+    #[test]
+    fn installs_from_cached_file_and_keeps_it_when_paths_are_unsafe() {
+        let root = TempDir::new();
+        let bytes = gz_tar(&[("go/bin/go", b"from-disk")]);
+        let cache = root.path().join("archives");
+        fs::create_dir_all(&cache).unwrap();
+        let path = cache.join("go1.2.3.linux-amd64.tar.gz");
+        fs::write(&path, &bytes).unwrap();
+        let versions = root.path().join("versions");
+        let status = install_archive_file(&path, &versions, "1.2.3").unwrap();
+        assert_eq!(status, InstallStatus::Installed);
+        assert_eq!(
+            fs::read(versions.join("1.2.3/go/bin/go")).unwrap(),
+            b"from-disk"
+        );
+        assert!(path.is_file());
+
+        let unsafe_bytes = raw_tar_gz(&[(
+            b"go/../../evil.txt".as_slice(),
+            b"nope".as_slice(),
+            b'0',
+            None,
+        )]);
+        let unsafe_path = cache.join("go1.2.4.linux-amd64.tar.gz");
+        fs::write(&unsafe_path, &unsafe_bytes).unwrap();
+        let err = install_archive_file(&unsafe_path, &versions, "1.2.4").unwrap_err();
+        assert!(matches!(err, Error::UnsafePath(_)), "{err}");
+        assert!(unsafe_path.is_file());
+        assert!(!versions.join("1.2.4").exists());
+        assert!(!root.path().join("evil.txt").exists());
     }
 
     fn raw_tar_gz(files: &[(&[u8], &[u8], u8, Option<&[u8]>)]) -> Vec<u8> {

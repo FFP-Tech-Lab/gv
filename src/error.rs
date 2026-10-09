@@ -35,7 +35,7 @@ pub enum Error {
     #[error("不支持的平台：{0}/{1}。gv 仅支持 Linux 与 macOS 的 amd64 和 arm64")]
     UnsupportedPlatform(String, String),
 
-    #[error("不支持的 shell：{0}。gv init 仅支持 bash 和 zsh")]
+    #[error("不支持的 shell：{0}。仅支持 bash 和 zsh")]
     UnsupportedShell(String),
 
     #[error("校验和不一致：期望 {expected}，实际 {actual}")]
@@ -58,6 +58,12 @@ pub enum Error {
 
     #[error("GV_ROOT 为空")]
     EmptyRoot,
+
+    #[error("不能同时指定版本和 --unset")]
+    VersionAndUnset,
+
+    #[error("请指定版本，或使用 --unset")]
+    VersionRequired,
 
     #[error("索引解析失败：{0}")]
     IndexParse(String),

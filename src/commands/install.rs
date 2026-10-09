@@ -14,7 +14,7 @@ pub async fn run(root: &Path, requested: &[String], quiet: bool) -> Result<(), E
 }
 
 async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Error> {
-    let query = resolve::parse_user_spec(requested)?;
+    let query = resolve::parse_install_spec(requested)?;
     if let VersionQuery::Exact(version) = &query {
         if store::tool_exists(root, &version.to_string(), "go") {
             println!("Go {version} 已安装");
@@ -41,17 +41,20 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
         return Ok(());
     }
 
-    let bytes =
-        download::download_archive(&plan.url, &plan.filename, download::download_ui_for(quiet))
-            .await?;
-    match download::install_verified_archive(
-        &bytes,
-        &plan.sha256,
-        &store::versions_dir(root),
-        &version,
-    )? {
-        InstallStatus::Installed => println!("已安装 Go {version}"),
-        InstallStatus::AlreadyPresent => println!("Go {version} 已安装"),
+    let versions_dir = store::versions_dir(root);
+    let cache_dir = store::archive_cache_dir(root);
+    let results = download::install_plans(
+        vec![plan],
+        download::download_ui_for(quiet),
+        &versions_dir,
+        &cache_dir,
+    )
+    .await;
+    match results.into_iter().next() {
+        Some(Ok((_, InstallStatus::Installed))) => println!("已安装 Go {version}"),
+        Some(Ok((_, InstallStatus::AlreadyPresent))) => println!("Go {version} 已安装"),
+        Some(Err((_, err))) => return Err(err),
+        None => return Err(Error::Failed("没有安装结果".into())),
     }
     Ok(())
 }
@@ -60,7 +63,7 @@ async fn install_many(root: &Path, requested: &[String], quiet: bool) -> Result<
     let mut failures = Vec::new();
     let mut pending = Vec::new();
     for spec in requested {
-        match resolve::parse_user_spec(spec) {
+        match resolve::parse_install_spec(spec) {
             Ok(VersionQuery::Exact(version)) => {
                 let name = version.to_string();
                 if store::tool_exists(root, &name, "go") {
@@ -69,7 +72,7 @@ async fn install_many(root: &Path, requested: &[String], quiet: bool) -> Result<
                     pending.push(spec.clone());
                 }
             }
-            Ok(VersionQuery::Minor { .. }) => pending.push(spec.clone()),
+            Ok(VersionQuery::Minor { .. } | VersionQuery::Latest) => pending.push(spec.clone()),
             Err(err) => failures.push(format!("Go {spec} 安装失败：{err}")),
         }
     }
@@ -139,8 +142,14 @@ async fn install_pending(
     }
 
     let versions_dir = store::versions_dir(root);
-    for item in
-        download::install_plans(plans, download::download_ui_for(quiet), &versions_dir).await
+    let cache_dir = store::archive_cache_dir(root);
+    for item in download::install_plans(
+        plans,
+        download::download_ui_for(quiet),
+        &versions_dir,
+        &cache_dir,
+    )
+    .await
     {
         match item {
             Ok((version, InstallStatus::Installed)) => println!("已安装 Go {version}"),
