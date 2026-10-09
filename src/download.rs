@@ -23,6 +23,7 @@ pub struct ReleaseFile {
     pub arch: String,
     pub sha256: String,
     pub kind: String,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +95,8 @@ struct RawFile {
     sha256: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[cfg(test)]
@@ -165,6 +168,7 @@ pub fn parse_index(body: &str) -> Result<Vec<Release>, Error> {
                 arch: file.arch,
                 sha256: file.sha256,
                 kind: file.kind,
+                size: file.size,
             })
             .collect();
         releases.push(Release {
@@ -198,18 +202,22 @@ pub struct RemoteVersion {
     pub version: String,
     pub stable: bool,
     pub installed: bool,
+    pub size: Option<u64>,
 }
 
-pub fn filter_remote_rows(releases: &[Release], all: bool) -> Vec<RemoteVersion> {
-    let mut rows: Vec<(Version, bool)> = releases
+pub fn filter_remote_rows(
+    releases: &[Release],
+    all: bool,
+    platform: &Platform,
+) -> Vec<RemoteVersion> {
+    let mut rows: Vec<&Release> = releases
         .iter()
         .filter(|release| all || release.stable)
-        .map(|release| (release.version.clone(), release.stable))
         .collect();
-    rows.sort_by(|left, right| right.0.cmp(&left.0));
+    rows.sort_by(|left, right| right.version.cmp(&left.version));
     let mut out = Vec::new();
-    for (version, stable) in rows {
-        let name = version.to_string();
+    for release in rows {
+        let name = release.version.to_string();
         if out
             .last()
             .is_some_and(|row: &RemoteVersion| row.version == name)
@@ -218,16 +226,31 @@ pub fn filter_remote_rows(releases: &[Release], all: bool) -> Vec<RemoteVersion>
         }
         out.push(RemoteVersion {
             version: name,
-            stable,
+            stable: release.stable,
             installed: false,
+            size: archive_size(release, platform),
         });
     }
     out
 }
 
+fn archive_size(release: &Release, platform: &Platform) -> Option<u64> {
+    release.files.iter().find_map(|file| {
+        if file.kind == "archive" && file.os == platform.os && file.arch == platform.arch {
+            file.size
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
-    filter_remote_rows(releases, all)
+    let platform = Platform {
+        os: "linux".into(),
+        arch: "amd64".into(),
+    };
+    filter_remote_rows(releases, all, &platform)
         .into_iter()
         .map(|row| row.version)
         .collect()
@@ -2038,7 +2061,7 @@ mod tests {
             format_remote(&[]),
             "No matching remote versions\n"
         );
-        let mut rows = filter_remote_rows(&releases, false);
+        let mut rows = filter_remote_rows(&releases, false, &platform());
         rows[0].installed = true;
         let text = format_remote(&rows);
         assert!(text.starts_with("* 1.23.10\n"), "{text}");
@@ -2050,16 +2073,43 @@ mod tests {
         assert!(remote_version_matches("1.23rc1", "1.23"));
         assert!(!remote_version_matches("1.23.10", "1.2"));
         assert!(remote_version_matches("1.23.10", "1.23."));
-        let rows = filter_remote_rows(&releases, true);
+        let rows = filter_remote_rows(&releases, true, &platform());
         assert!(rows
             .iter()
             .any(|row| row.version == "1.23.10" && row.stable));
         assert!(rows
             .iter()
             .any(|row| row.version == "1.23rc1" && !row.stable));
-        assert!(filter_remote_rows(&releases, false)
+        assert!(filter_remote_rows(&releases, false, &platform())
             .iter()
             .all(|row| row.stable));
+    }
+
+    #[test]
+    fn remote_rows_keep_the_archive_size_for_this_platform() {
+        let releases = parse_index(
+            r#"[{"version":"go1.22.5","stable":true,"files":[
+                {"filename":"go1.22.5.src.tar.gz","os":"","arch":"","sha256":"src","kind":"source","size":10},
+                {"filename":"go1.22.5.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"abc","kind":"archive","size":1234},
+                {"filename":"go1.22.5.darwin-arm64.tar.gz","os":"darwin","arch":"arm64","sha256":"def","kind":"archive","size":99}
+            ]},
+            {"version":"go1.22.4","stable":true,"files":[
+                {"filename":"go1.22.4.linux-amd64.tar.gz","os":"linux","arch":"amd64","sha256":"old","kind":"archive"}
+            ]}]"#,
+        )
+        .unwrap();
+        let linux = filter_remote_rows(&releases, false, &platform());
+        assert_eq!(linux[0].version, "1.22.5");
+        assert_eq!(linux[0].size, Some(1234));
+        assert_eq!(linux[1].size, None);
+        let darwin = Platform {
+            os: "darwin".into(),
+            arch: "arm64".into(),
+        };
+        assert_eq!(
+            filter_remote_rows(&releases, false, &darwin)[0].size,
+            Some(99)
+        );
     }
 
     #[test]

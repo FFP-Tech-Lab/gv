@@ -1,4 +1,6 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -81,6 +83,7 @@ pub fn format_remote_json(versions: &[RemoteVersion]) -> Result<String, Error> {
                 "version": version.version,
                 "stable": version.stable,
                 "installed": version.installed,
+                "size": version.size,
             })
         })
         .collect();
@@ -113,7 +116,8 @@ pub async fn load_remote_rows(
         .iter()
         .map(ToString::to_string)
         .collect();
-    let mut rows = download::filter_remote_rows(&loaded.releases, all);
+    let platform = crate::platform::Platform::current()?;
+    let mut rows = download::filter_remote_rows(&loaded.releases, all, &platform);
     if let Some(prefix) = prefix.filter(|prefix| !prefix.trim().is_empty()) {
         rows.retain(|row| download::remote_version_matches(&row.version, prefix));
     }
@@ -150,12 +154,209 @@ pub async fn remote(
     if let Some(warning) = &loaded.warning {
         eprintln!("gv: {warning}");
     }
+    let expanded = prefix.is_some_and(|value| !value.trim().is_empty());
     let text = match output {
+        OutputFormat::Text if io::stdout().is_terminal() => {
+            let platform = crate::platform::Platform::current()?;
+            let label = format!("{}/{}", platform.os, platform.arch);
+            format_remote_table(&loaded.rows, expanded, &label)
+        }
         OutputFormat::Text => download::format_remote(&loaded.rows),
         OutputFormat::Json => format_remote_json(&loaded.rows)?,
     };
     print!("{text}");
     Ok(())
+}
+
+struct TableLine {
+    installed: bool,
+    version: String,
+    size: Option<u64>,
+    note: String,
+}
+
+fn format_remote_table(rows: &[RemoteVersion], expanded: bool, platform_label: &str) -> String {
+    if rows.is_empty() {
+        return "No matching remote versions\n".to_string();
+    }
+    let lines = if expanded {
+        expand_rows(rows)
+    } else {
+        collapse_rows(rows)
+    };
+    render_table(&lines, platform_label)
+}
+
+fn expand_rows(rows: &[RemoteVersion]) -> Vec<TableLine> {
+    rows.iter()
+        .map(|row| {
+            let channel = if row.stable {
+                None
+            } else {
+                preview_channel(&row.version)
+            };
+            TableLine::from_remote(row, note_parts(&[], 0, channel))
+        })
+        .collect()
+}
+
+fn collapse_rows(rows: &[RemoteVersion]) -> Vec<TableLine> {
+    let mut stable_groups: Vec<Vec<&RemoteVersion>> = Vec::new();
+    let mut previews = Vec::new();
+    for row in rows {
+        if row.stable {
+            match minor_of(&row.version) {
+                Some(key) => {
+                    if let Some(group) = stable_groups
+                        .iter_mut()
+                        .find(|group| minor_of(&group[0].version) == Some(key))
+                    {
+                        group.push(row);
+                    } else {
+                        stable_groups.push(vec![row]);
+                    }
+                }
+                None => stable_groups.push(vec![row]),
+            }
+        } else {
+            previews.push(row);
+        }
+    }
+    let mut lines = Vec::new();
+    for mut group in stable_groups {
+        group.sort_by(|left, right| cmp_version_desc(&left.version, &right.version));
+        let latest = group[0];
+        let have: Vec<String> = group
+            .iter()
+            .skip(1)
+            .filter(|row| row.installed)
+            .map(|row| row.version.clone())
+            .collect();
+        let older = group.len().saturating_sub(1);
+        lines.push(TableLine::from_remote(
+            latest,
+            note_parts(&have, older, None),
+        ));
+    }
+    for row in previews {
+        lines.push(TableLine::from_remote(
+            row,
+            note_parts(&[], 0, preview_channel(&row.version)),
+        ));
+    }
+    lines.sort_by(|left, right| cmp_version_desc(&left.version, &right.version));
+    lines
+}
+
+fn note_parts(have: &[String], older: usize, channel: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(channel) = channel {
+        parts.push(channel.to_string());
+    }
+    if !have.is_empty() {
+        parts.push(format!("have {}", have.join(", ")));
+    }
+    if older > 0 {
+        parts.push(format!("{older} older"));
+    }
+    parts.join(", ")
+}
+
+fn preview_channel(version: &str) -> Option<&'static str> {
+    resolve::parse_release_version(version)
+        .ok()
+        .and_then(|parsed| parsed.channel())
+}
+
+fn minor_of(version: &str) -> Option<(u64, u64)> {
+    resolve::parse_release_version(version)
+        .ok()
+        .map(|parsed| parsed.minor_key())
+}
+
+fn cmp_version_desc(left: &str, right: &str) -> Ordering {
+    match (
+        resolve::parse_release_version(left).ok(),
+        resolve::parse_release_version(right).ok(),
+    ) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => right.cmp(left),
+    }
+}
+
+impl TableLine {
+    fn from_remote(row: &RemoteVersion, note: String) -> Self {
+        Self {
+            installed: row.installed,
+            version: row.version.clone(),
+            size: row.size,
+            note,
+        }
+    }
+}
+
+fn render_table(lines: &[TableLine], platform_label: &str) -> String {
+    let version_width = lines
+        .iter()
+        .map(|line| line.version.len())
+        .max()
+        .unwrap_or(0)
+        .max("VERSION".len());
+    let sizes: Vec<String> = lines
+        .iter()
+        .map(|line| match line.size {
+            Some(size) => format_bytes(size),
+            None => "-".to_string(),
+        })
+        .collect();
+    let size_width = sizes
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+        .max("SIZE".len());
+    let platform_width = platform_label.len().max("PLATFORM".len());
+    let mut text = format!(
+        "  {version:<version_width$}   {size:<size_width$}  {platform:<platform_width$}   NOTE\n",
+        version = "VERSION",
+        size = "SIZE",
+        platform = "PLATFORM",
+    );
+    for (line, size) in lines.iter().zip(sizes) {
+        let mark = if line.installed { "*" } else { " " };
+        let mut row = format!(
+            "{mark} {version:<version_width$}   {size:<size_width$}  {platform:<platform_width$}",
+            version = line.version,
+            platform = platform_label,
+        );
+        if !line.note.is_empty() {
+            row.push_str("   ");
+            row.push_str(&line.note);
+        }
+        row.push('\n');
+        text.push_str(&row);
+    }
+    text
+}
+
+fn format_bytes(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if size < KB {
+        format!("{size} B")
+    } else if size < MB {
+        format!("{} KB", one_decimal(size, KB))
+    } else {
+        format!("{} MB", one_decimal(size, MB))
+    }
+}
+
+fn one_decimal(size: u64, unit: u64) -> String {
+    let scaled = (size as f64) / (unit as f64);
+    let text = format!("{scaled:.1}");
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 #[cfg(test)]
@@ -224,20 +425,85 @@ mod tests {
             version: "1.23.4".into(),
             stable: true,
             installed: true,
+            size: Some(2048),
         };
         let preview = download::RemoteVersion {
             version: "1.24rc1".into(),
             stable: false,
             installed: false,
+            size: None,
         };
         let text = format_remote_json(&[stable.clone(), preview]).unwrap();
         let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(value["versions"][0]["version"], "1.23.4");
         assert_eq!(value["versions"][0]["stable"], true);
         assert_eq!(value["versions"][0]["installed"], true);
+        assert_eq!(value["versions"][0]["size"], 2048);
         assert_eq!(value["versions"][1]["version"], "1.24rc1");
         assert_eq!(value["versions"][1]["stable"], false);
         assert_eq!(value["versions"][1]["installed"], false);
+        assert!(value["versions"][1]["size"].is_null());
         assert_eq!(download::format_remote(&[stable]), "* 1.23.4\n");
+    }
+
+    fn remote_row(
+        version: &str,
+        stable: bool,
+        installed: bool,
+        size: Option<u64>,
+    ) -> RemoteVersion {
+        RemoteVersion {
+            version: version.into(),
+            stable,
+            installed,
+            size,
+        }
+    }
+
+    #[test]
+    fn table_collapses_each_minor_and_notes_size_and_installed_patches() {
+        let rows = vec![
+            remote_row("1.24.7", true, false, Some(1024 * 1024 + 1024 * 1024 / 2)),
+            remote_row("1.23.10", true, false, None),
+            remote_row("1.23.4", true, true, Some(1024)),
+            remote_row("1.23.0", true, false, Some(512)),
+        ];
+        let text = format_remote_table(&rows, false, "linux/amd64");
+        assert_eq!(
+            text,
+            "  VERSION   SIZE    PLATFORM      NOTE\n  1.24.7    1.5 MB  linux/amd64\n  1.23.10   -       linux/amd64   have 1.23.4, 2 older\n"
+        );
+        assert!(!text.contains("1.23.0"));
+    }
+
+    #[test]
+    fn table_expands_a_prefix_and_keeps_preview_rows_beside_collapsed_stable_lines() {
+        let rows = vec![
+            remote_row("1.24.0", true, false, Some(1024)),
+            remote_row("1.24beta1", false, false, None),
+            remote_row("1.23.4", true, true, Some(1024)),
+            remote_row("1.23rc1", false, false, Some(512)),
+            remote_row("1.23.0", true, false, Some(256)),
+        ];
+        let collapsed = format_remote_table(&rows, false, "linux/amd64");
+        assert!(collapsed.contains("  1.24.0"), "{collapsed}");
+        assert!(collapsed.contains("1.24beta1"), "{collapsed}");
+        assert!(collapsed.contains("linux/amd64   beta"), "{collapsed}");
+        assert!(collapsed.contains("* 1.23.4"), "{collapsed}");
+        assert!(collapsed.contains("1 older"), "{collapsed}");
+        assert!(collapsed.contains("1.23rc1"), "{collapsed}");
+        assert!(collapsed.contains("linux/amd64   rc"), "{collapsed}");
+        assert!(!collapsed.contains("1.23.0"), "{collapsed}");
+        assert!(collapsed.contains("1 KB"), "{collapsed}");
+        assert!(collapsed.contains("512 B"), "{collapsed}");
+
+        let expanded = format_remote_table(&rows, true, "linux/amd64");
+        assert!(expanded.contains("1.23.0"), "{expanded}");
+        assert!(expanded.contains("1.24beta1"), "{expanded}");
+        assert!(!expanded.contains("older"), "{expanded}");
+        assert_eq!(
+            format_remote_table(&[], false, "linux/amd64"),
+            "No matching remote versions\n"
+        );
     }
 }

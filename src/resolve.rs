@@ -35,6 +35,18 @@ impl Version {
     pub fn matches_minor(&self, major: u64, minor: u64) -> bool {
         self.major == major && self.minor == minor
     }
+
+    pub fn minor_key(&self) -> (u64, u64) {
+        (self.major, self.minor)
+    }
+
+    pub fn channel(&self) -> Option<&'static str> {
+        let kind = self.pre.as_ref()?.kind;
+        Some(match kind {
+            PreKind::Beta => "beta",
+            PreKind::Rc => "rc",
+        })
+    }
 }
 
 impl fmt::Display for Version {
