@@ -31,6 +31,14 @@ _gv() {
 $(gv list 2>/dev/null)
 EOF
       if [[ "${cmd}" == install ]]; then
+        while IFS= read -r line; do
+          case "${line}" in
+            \*\ *) versions="${versions} ${line#\* }" ;;
+            "  "*) versions="${versions} ${line#  }" ;;
+          esac
+        done <<EOF
+$(gv list-remote --offline 2>/dev/null)
+EOF
         versions="${versions} latest"
       fi
       COMPREPLY=( $(compgen -W "${versions}" -- "${cur}") )
@@ -42,7 +50,7 @@ EOF
       COMPREPLY=( $(compgen -W "--output text json" -- "${cur}") )
       ;;
     list-remote)
-      COMPREPLY=( $(compgen -W "--all --refresh --output text json" -- "${cur}") )
+      COMPREPLY=( $(compgen -W "--all --refresh --offline --output text json" -- "${cur}") )
       ;;
   esac
 }
@@ -63,7 +71,10 @@ _gv() {
     install|uninstall|use|shell)
       versions=(${(f)"$(gv list 2>/dev/null | sed -n 's/^[* ][[:space:]]*//p' | grep -E '^[0-9]')"})
       case "${cmd}" in
-        install) versions+=(latest --quiet) ;;
+        install)
+          versions+=(${(f)"$(gv list-remote --offline 2>/dev/null | sed -n 's/^[* ][[:space:]]*//p' | grep -E '^[0-9]')"})
+          versions+=(latest --quiet)
+          ;;
         uninstall) versions+=(--force) ;;
         use) versions+=(--global --unset) ;;
         shell) versions+=(--unset) ;;
@@ -77,7 +88,7 @@ _gv() {
       compadd -- --output text json
       ;;
     list-remote)
-      compadd -- --all --refresh --output text json
+      compadd -- --all --refresh --offline --output text json
       ;;
   esac
 }
@@ -118,6 +129,13 @@ mod tests {
                 assert!(text.contains(name), "{shell} missing {name}");
             }
             assert!(text.contains("gv list"), "{shell}");
+            assert!(text.contains("gv list-remote --offline"), "{shell}");
+            assert!(
+                !text
+                    .replace("gv list-remote --offline", "")
+                    .contains("gv list-remote"),
+                "{shell}"
+            );
             assert!(text.contains("latest"), "{shell}");
             assert!(!text.contains("bashrc") || shell == "bash");
             assert!(!text.contains("zshrc") || shell == "zsh");

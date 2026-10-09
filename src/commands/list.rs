@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::SystemTime;
 
-use crate::download::{self, RemoteVersion};
+use crate::download::{self, IndexPolicy, RemoteVersion};
 use crate::error::Error;
 use crate::resolve;
 use crate::store;
@@ -24,7 +26,7 @@ pub fn installed_report(
 ) -> Result<ListReport, Error> {
     let installed = resolve::installed_versions(root)?;
     let names: Vec<String> = installed.iter().map(ToString::to_string).collect();
-    let (current, warning) = match resolve::resolve(cwd, root, gv_version) {
+    let (current, warning) = match resolve::resolve_using(cwd, root, gv_version, Some(&installed)) {
         Ok(resolved) => (Some(resolved.version.to_string()), None),
         Err(Error::NoVersion) => (None, None),
         Err(err @ Error::NotInstalled(_)) => (None, Some(err.to_string())),
@@ -78,6 +80,7 @@ pub fn format_remote_json(versions: &[RemoteVersion]) -> Result<String, Error> {
             serde_json::json!({
                 "version": version.version,
                 "stable": version.stable,
+                "installed": version.installed,
             })
         })
         .collect();
@@ -94,17 +97,42 @@ pub async fn remote(
     root: &Path,
     all: bool,
     refresh: bool,
+    offline: bool,
+    prefix: Option<&str>,
     output: OutputFormat,
 ) -> Result<(), Error> {
+    if offline && refresh {
+        return Err(Error::Failed(
+            "Cannot combine --offline and --refresh".into(),
+        ));
+    }
+    let policy = if refresh {
+        IndexPolicy::Refresh
+    } else if offline {
+        IndexPolicy::Offline
+    } else {
+        IndexPolicy::RefreshIfStale
+    };
     let url = store::index_url();
-    let loaded = download::load_index(root, &url, refresh).await?;
+    let client = download::http_client()?;
+    let loaded = download::load_index(&client, root, &url, policy, SystemTime::now()).await?;
+    if let Some(warning) = &loaded.warning {
+        eprintln!("gv: {warning}");
+    }
+    let installed: HashSet<String> = resolve::installed_versions(root)?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut rows = download::filter_remote_rows(&loaded.releases, all);
+    if let Some(prefix) = prefix.filter(|prefix| !prefix.trim().is_empty()) {
+        rows.retain(|row| download::remote_version_matches(&row.version, prefix));
+    }
+    for row in &mut rows {
+        row.installed = installed.contains(&row.version);
+    }
     let text = match output {
-        OutputFormat::Text => {
-            download::format_remote(&download::filter_remote(&loaded.releases, all))
-        }
-        OutputFormat::Json => {
-            format_remote_json(&download::filter_remote_rows(&loaded.releases, all))?
-        }
+        OutputFormat::Text => download::format_remote(&rows),
+        OutputFormat::Json => format_remote_json(&rows)?,
     };
     print!("{text}");
     Ok(())
@@ -175,17 +203,21 @@ mod tests {
         let stable = download::RemoteVersion {
             version: "1.23.4".into(),
             stable: true,
+            installed: true,
         };
         let preview = download::RemoteVersion {
             version: "1.24rc1".into(),
             stable: false,
+            installed: false,
         };
-        let text = format_remote_json(&[stable, preview]).unwrap();
+        let text = format_remote_json(&[stable.clone(), preview]).unwrap();
         let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(value["versions"][0]["version"], "1.23.4");
         assert_eq!(value["versions"][0]["stable"], true);
+        assert_eq!(value["versions"][0]["installed"], true);
         assert_eq!(value["versions"][1]["version"], "1.24rc1");
         assert_eq!(value["versions"][1]["stable"], false);
-        assert_eq!(download::format_remote(&["1.23.4".into()]), "1.23.4\n");
+        assert_eq!(value["versions"][1]["installed"], false);
+        assert_eq!(download::format_remote(&[stable]), "* 1.23.4\n");
     }
 }

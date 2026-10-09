@@ -1,8 +1,8 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use flate2::read::GzDecoder;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -49,7 +49,28 @@ pub enum InstallStatus {
 pub struct LoadedIndex {
     pub releases: Vec<Release>,
     pub from_cache: bool,
+    /// A network refresh was already attempted, including a failed refresh that fell back to cache.
+    pub refresh_attempted: bool,
+    pub warning: Option<String>,
 }
+
+/// How `load_index` treats `cache/index.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexPolicy {
+    /// Use a parseable cache even when it is older than [`INDEX_MAX_AGE`].
+    AllowStale,
+    /// Download again when the cache is missing, older than [`INDEX_MAX_AGE`], or has no fetch time.
+    RefreshIfStale,
+    /// Ignore the cache and download.
+    Refresh,
+    /// Never download. A missing cache yields an empty release list.
+    Offline,
+}
+
+pub const INDEX_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+const DOWNLOAD_PARALLELISM: usize = 3;
 
 #[derive(Debug, Deserialize)]
 struct RawRelease {
@@ -175,6 +196,7 @@ pub fn plan_install(
 pub struct RemoteVersion {
     pub version: String,
     pub stable: bool,
+    pub installed: bool,
 }
 
 pub fn filter_remote_rows(releases: &[Release], all: bool) -> Vec<RemoteVersion> {
@@ -196,25 +218,51 @@ pub fn filter_remote_rows(releases: &[Release], all: bool) -> Vec<RemoteVersion>
         out.push(RemoteVersion {
             version: name,
             stable,
+            installed: false,
         });
     }
     out
 }
 
-pub fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
+#[cfg(test)]
+fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
     filter_remote_rows(releases, all)
         .into_iter()
         .map(|row| row.version)
         .collect()
 }
 
-pub fn format_remote(versions: &[String]) -> String {
+pub fn format_remote(versions: &[RemoteVersion]) -> String {
     if versions.is_empty() {
         return "No matching remote versions\n".to_string();
     }
-    let mut text = versions.join("\n");
-    text.push('\n');
+    let mut text = String::new();
+    for version in versions {
+        if version.installed {
+            text.push_str("* ");
+        } else {
+            text.push_str("  ");
+        }
+        text.push_str(&version.version);
+        text.push('\n');
+    }
     text
+}
+
+/// `1.23` matches that minor, `1.23.4` matches that exact release, and anything else is a string prefix.
+pub fn remote_version_matches(name: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        return true;
+    }
+    let Ok(version) = resolve::parse_release_version(name) else {
+        return name.starts_with(filter);
+    };
+    match resolve::parse_user_spec(filter) {
+        Ok(VersionQuery::Exact(exact)) => version == exact,
+        Ok(VersionQuery::Minor { major, minor }) => version.matches_minor(major, minor),
+        Ok(VersionQuery::Latest) | Err(_) => name.starts_with(filter),
+    }
 }
 
 fn select_release<'a>(releases: &'a [Release], query: &VersionQuery) -> Result<&'a Release, Error> {
@@ -277,6 +325,12 @@ fn filename_is_safe(name: &str) -> bool {
         && name.ends_with(".tar.gz")
 }
 
+#[derive(Debug, Clone)]
+struct IndexCache {
+    releases: Vec<Release>,
+    fresh: bool,
+}
+
 pub fn read_cached_index(root: &Path, url: &str) -> Result<Option<String>, Error> {
     let dir = store::cache_dir(root);
     let url_path = dir.join("index.url");
@@ -295,7 +349,32 @@ pub fn read_cached_index(root: &Path, url: &str) -> Result<Option<String>, Error
     Ok(Some(body))
 }
 
+fn read_fetched_at(root: &Path) -> Option<u64> {
+    let text = fs::read_to_string(store::cache_dir(root).join("index.fetched")).ok()?;
+    text.trim().parse().ok()
+}
+
+pub fn index_is_fresh(fetched_at: Option<u64>, now: SystemTime) -> bool {
+    let Some(fetched_at) = fetched_at else {
+        return false;
+    };
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(fetched_at) < INDEX_MAX_AGE.as_secs()
+}
+
 pub fn write_cached_index(root: &Path, url: &str, body: &str) -> Result<(), Error> {
+    write_cached_index_at(root, url, body, SystemTime::now())
+}
+
+pub fn write_cached_index_at(
+    root: &Path,
+    url: &str,
+    body: &str,
+    now: SystemTime,
+) -> Result<(), Error> {
     let dir = store::cache_dir(root);
     fs::create_dir_all(&dir)?;
     let body_path = dir.join("index.json");
@@ -304,62 +383,144 @@ pub fn write_cached_index(root: &Path, url: &str, body: &str) -> Result<(), Erro
     fs::write(&tmp, body)?;
     fs::rename(&tmp, &body_path)?;
     fs::write(url_path, format!("{}\n", url.trim()))?;
+    let fetched = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    fs::write(dir.join("index.fetched"), format!("{fetched}\n"))?;
     Ok(())
 }
 
-pub fn try_cached_index(
-    root: &Path,
-    url: &str,
-    refresh: bool,
-) -> Result<Option<Vec<Release>>, Error> {
-    if refresh {
-        return Ok(None);
-    }
+fn read_index_cache(root: &Path, url: &str, now: SystemTime) -> Result<Option<IndexCache>, Error> {
     let Some(body) = read_cached_index(root, url)? else {
         return Ok(None);
     };
     match parse_index(&body) {
-        Ok(releases) => Ok(Some(releases)),
+        Ok(releases) => Ok(Some(IndexCache {
+            releases,
+            fresh: index_is_fresh(read_fetched_at(root), now),
+        })),
         Err(_) => Ok(None),
     }
 }
 
-pub async fn load_index(root: &Path, url: &str, refresh: bool) -> Result<LoadedIndex, Error> {
-    if let Some(releases) = try_cached_index(root, url, refresh)? {
-        return Ok(LoadedIndex {
-            releases,
-            from_cache: true,
-        });
+fn cached_index(cache: IndexCache, warning: Option<String>, refresh_attempted: bool) -> LoadedIndex {
+    LoadedIndex {
+        releases: cache.releases,
+        from_cache: true,
+        refresh_attempted,
+        warning,
     }
-    let bytes = http_get(url).await?;
+}
+
+pub async fn load_index(
+    client: &reqwest::Client,
+    root: &Path,
+    url: &str,
+    policy: IndexPolicy,
+    now: SystemTime,
+) -> Result<LoadedIndex, Error> {
+    let cached = read_index_cache(root, url, now)?;
+    match policy {
+        IndexPolicy::Offline => {
+            return Ok(match cached {
+                Some(cache) => cached_index(cache, None, false),
+                None => LoadedIndex {
+                    releases: Vec::new(),
+                    from_cache: false,
+                    refresh_attempted: false,
+                    warning: None,
+                },
+            });
+        }
+        IndexPolicy::AllowStale => {
+            if let Some(cache) = cached {
+                return Ok(cached_index(cache, None, false));
+            }
+        }
+        IndexPolicy::RefreshIfStale => {
+            if let Some(cache) = cached {
+                if cache.fresh {
+                    return Ok(cached_index(cache, None, false));
+                }
+                match fetch_index(client, root, url).await {
+                    Ok(releases) => {
+                        return Ok(LoadedIndex {
+                            releases,
+                            from_cache: false,
+                            refresh_attempted: true,
+                            warning: None,
+                        });
+                    }
+                    Err(err) => {
+                        return Ok(cached_index(
+                            cache,
+                            Some(format!(
+                                "Index refresh failed ({err}). Using the cached index"
+                            )),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+        IndexPolicy::Refresh => {}
+    }
+    let releases = fetch_index(client, root, url).await?;
+    Ok(LoadedIndex {
+        releases,
+        from_cache: false,
+        refresh_attempted: true,
+        warning: None,
+    })
+}
+
+async fn fetch_index(
+    client: &reqwest::Client,
+    root: &Path,
+    url: &str,
+) -> Result<Vec<Release>, Error> {
+    let bytes = http_get(client, url).await?;
     let body =
         String::from_utf8(bytes).map_err(|_| Error::IndexParse("index is not UTF-8".into()))?;
     let releases = parse_index(&body)?;
     write_cached_index(root, url, &body)?;
-    Ok(LoadedIndex {
-        releases,
-        from_cache: false,
-    })
+    Ok(releases)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DownloadUi {
-    Bar,
-    Plain,
+pub struct TransferUi {
+    pub bar: bool,
+    pub status: bool,
 }
 
-fn download_ui(quiet: bool, stderr_is_tty: bool, term: Option<&str>) -> DownloadUi {
+fn transfer_ui(quiet: bool, stderr_is_tty: bool, term: Option<&str>) -> TransferUi {
     let dumb = term.is_some_and(|value| value == "dumb");
-    if quiet || !stderr_is_tty || dumb {
-        DownloadUi::Plain
-    } else {
-        DownloadUi::Bar
+    TransferUi {
+        bar: !quiet && stderr_is_tty && !dumb,
+        status: !quiet,
     }
 }
 
-pub fn download_ui_for(quiet: bool) -> DownloadUi {
+pub fn transfer_ui_for(quiet: bool) -> TransferUi {
     let term = std::env::var("TERM").ok();
-    download_ui(quiet, io::stderr().is_terminal(), term.as_deref())
+    transfer_ui(quiet, io::stderr().is_terminal(), term.as_deref())
+}
+
+pub fn cached_archive_status(filename: &str) -> String {
+    format!("Using cached archive {filename}\n")
+}
+
+pub fn extract_status(version: &str) -> String {
+    format!("Extracting Go {version}\n")
+}
+
+fn write_status(ui: TransferUi, line: &str) {
+    if !ui.status {
+        return;
+    }
+    let mut stderr = io::stderr().lock();
+    let _ = stderr.write_all(line.as_bytes());
 }
 
 fn format_transferred(
@@ -381,14 +542,25 @@ fn format_transferred(
     }
 }
 
-pub async fn http_get(url: &str) -> Result<Vec<u8>, Error> {
-    let response = send_get(url).await?;
+pub fn http_client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
+        .user_agent(concat!("gv/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(900))
+        .gzip(true)
+        .build()
+        .map_err(|err| Error::Failed(format!("failed to build HTTP client: {err}")))
+}
+
+pub async fn http_get(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Error> {
+    let response = send_get(client, url, None).await?;
     read_chunks(url, response, |_, _| {}).await
 }
 
 #[cfg(test)]
-pub async fn download_archive(url: &str, label: &str, ui: DownloadUi) -> Result<Vec<u8>, Error> {
-    let response = send_get(url).await?;
+pub async fn download_archive(url: &str, label: &str, ui: TransferUi) -> Result<Vec<u8>, Error> {
+    let client = http_client()?;
+    let response = send_get(&client, url, None).await?;
     let total = response.content_length();
     let mut progress = TransferProgress::start(ui, label, total);
     let bytes = read_chunks(url, response, |downloaded, _| {
@@ -406,8 +578,8 @@ enum ProgressRender {
     Plain,
 }
 
-fn progress_render(count: usize, ui: DownloadUi, stderr_hidden: bool) -> ProgressRender {
-    if ui != DownloadUi::Bar || stderr_hidden {
+fn progress_render(count: usize, ui: TransferUi, stderr_hidden: bool) -> ProgressRender {
+    if !ui.bar || stderr_hidden {
         ProgressRender::Plain
     } else if count > 1 {
         ProgressRender::Multi
@@ -417,38 +589,40 @@ fn progress_render(count: usize, ui: DownloadUi, stderr_hidden: bool) -> Progres
 }
 
 /// Download and install several plans. When there is more than one and the terminal can draw, each version gets its own progress bar; otherwise each prints one line of transferred bytes.
-/// A failure for one version does not cancel the others. Archives land in `cache_dir` first and are extracted only after the checksum passes.
+/// A failure for one version does not cancel the others. Archives land in `cache_dir` first and are extracted only after the checksum passes. At most [`DOWNLOAD_PARALLELISM`] downloads run at once.
 pub async fn install_plans(
+    client: &reqwest::Client,
     plans: Vec<InstallPlan>,
-    ui: DownloadUi,
+    ui: TransferUi,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     if plans.len() <= 1 {
-        return install_plans_sequential(plans, ui, versions_dir, cache_dir).await;
+        return install_plans_sequential(client, plans, ui, versions_dir, cache_dir).await;
     }
     let render = progress_render(plans.len(), ui, ProgressDrawTarget::stderr().is_hidden());
     match render {
         ProgressRender::Multi => {
             let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            install_plans_concurrent(plans, Some(multi), versions_dir, cache_dir).await
+            install_plans_concurrent(client, plans, Some(multi), ui, versions_dir, cache_dir).await
         }
         ProgressRender::Plain | ProgressRender::SingleBar => {
-            install_plans_concurrent(plans, None, versions_dir, cache_dir).await
+            install_plans_concurrent(client, plans, None, ui, versions_dir, cache_dir).await
         }
     }
 }
 
 async fn install_plans_sequential(
+    client: &reqwest::Client,
     plans: Vec<InstallPlan>,
-    ui: DownloadUi,
+    ui: TransferUi,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     let mut results = Vec::with_capacity(plans.len());
     for plan in plans {
         let version = plan.version.to_string();
-        match download_and_install(plan, ui, versions_dir, cache_dir).await {
+        match download_and_install(client, plan, ui, None, versions_dir, cache_dir).await {
             Ok(status) => results.push(Ok((version, status))),
             Err(err) => results.push(Err((version, err))),
         }
@@ -457,8 +631,10 @@ async fn install_plans_sequential(
 }
 
 async fn install_plans_concurrent(
+    client: &reqwest::Client,
     plans: Vec<InstallPlan>,
     multi: Option<MultiProgress>,
+    ui: TransferUi,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
@@ -475,6 +651,7 @@ async fn install_plans_concurrent(
             .collect(),
         None => (0..plans.len()).map(|_| None).collect(),
     };
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_PARALLELISM));
 
     let mut jobs = Vec::with_capacity(plans.len());
     for (index, plan) in plans.into_iter().enumerate() {
@@ -482,12 +659,22 @@ async fn install_plans_concurrent(
         let cache_dir = cache_dir.to_path_buf();
         let bar = bars[index].clone();
         let version = plan.version.to_string();
+        let client = client.clone();
+        let semaphore = semaphore.clone();
         let handle = tokio::spawn(async move {
-            if let Some(bar) = bar {
-                download_and_install_bar(plan, &bar, &versions_dir, &cache_dir).await
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                return Err(Error::Failed("download was cancelled".into()));
+            };
+            let task_ui = if bar.is_some() {
+                ui
             } else {
-                download_and_install(plan, DownloadUi::Plain, &versions_dir, &cache_dir).await
-            }
+                TransferUi {
+                    bar: false,
+                    status: ui.status,
+                }
+            };
+            download_and_install(&client, plan, task_ui, bar.as_ref(), &versions_dir, &cache_dir)
+                .await
         });
         jobs.push((index, version, handle));
     }
@@ -509,31 +696,18 @@ async fn install_plans_concurrent(
     finished.into_iter().map(|(_, result)| result).collect()
 }
 
-enum DownloadMode<'a> {
-    Plain(DownloadUi),
-    Bar(&'a ProgressBar),
-}
-
 async fn download_and_install(
+    client: &reqwest::Client,
     plan: InstallPlan,
-    ui: DownloadUi,
+    ui: TransferUi,
+    shared_bar: Option<&ProgressBar>,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Result<InstallStatus, Error> {
     let version = plan.version.to_string();
-    let path = fetch_cached_archive(&plan, cache_dir, DownloadMode::Plain(ui)).await?;
-    install_archive_file(&path, versions_dir, &version)
-}
-
-async fn download_and_install_bar(
-    plan: InstallPlan,
-    bar: &ProgressBar,
-    versions_dir: &Path,
-    cache_dir: &Path,
-) -> Result<InstallStatus, Error> {
-    let version = plan.version.to_string();
-    let path = fetch_cached_archive(&plan, cache_dir, DownloadMode::Bar(bar)).await?;
-    install_archive_file(&path, versions_dir, &version)
+    let path = fetch_cached_archive(client, &plan, cache_dir, ui, shared_bar).await?;
+    write_status(ui, &extract_status(&version));
+    install_archive_file_async(path, versions_dir.to_path_buf(), version).await
 }
 
 fn archive_dest(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
@@ -543,122 +717,206 @@ fn archive_dest(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
     Ok(cache_dir.join(filename))
 }
 
+fn partial_archive_path(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
+    if !filename_is_safe(filename) {
+        return Err(Error::UnsafeFilename(filename.to_string()));
+    }
+    Ok(cache_dir.join(format!(".partial-{filename}")))
+}
+
 /// Reuse a cached file when it exists and the checksum matches. Delete the file if the check fails; a newly downloaded file is deleted the same way if its check fails.
 async fn fetch_cached_archive(
+    client: &reqwest::Client,
     plan: &InstallPlan,
     cache_dir: &Path,
-    mode: DownloadMode<'_>,
+    ui: TransferUi,
+    shared_bar: Option<&ProgressBar>,
 ) -> Result<PathBuf, Error> {
     let dest = archive_dest(cache_dir, &plan.filename)?;
-    if dest.is_file() && verify_file_sha256(&dest, &plan.sha256).is_ok() {
-        return Ok(dest);
-    }
-    if dest.exists() {
-        fs::remove_file(&dest)?;
-    }
-    let downloaded = match mode {
-        DownloadMode::Plain(ui) => download_archive_to(&plan.url, &plan.filename, ui, &dest).await,
-        DownloadMode::Bar(bar) => {
-            download_archive_bar_to(&plan.url, &plan.filename, bar, &dest).await
+    if dest.is_file() {
+        match verify_file_sha256_async(dest.clone(), plan.sha256.clone()).await {
+            Ok(()) => {
+                write_status(ui, &cached_archive_status(&plan.filename));
+                return Ok(dest);
+            }
+            Err(Error::Checksum { .. }) => {
+                let _ = fs::remove_file(&dest);
+            }
+            Err(err) => return Err(err),
         }
-    };
-    if let Err(err) = downloaded {
-        let _ = fs::remove_file(&dest);
-        return Err(err);
     }
-    if let Err(err) = verify_file_sha256(&dest, &plan.sha256) {
+    let partial = partial_archive_path(cache_dir, &plan.filename)?;
+    if let Err(err) = download_with_retry(client, plan, &dest, &partial, ui, shared_bar).await {
+        if let Some(bar) = shared_bar {
+            bar.finish_and_clear();
+        }
         let _ = fs::remove_file(&dest);
         return Err(err);
     }
     Ok(dest)
 }
 
-async fn download_archive_to(
-    url: &str,
-    label: &str,
-    ui: DownloadUi,
-    dest: &Path,
-) -> Result<(), Error> {
-    let response = send_get(url).await?;
-    let total = response.content_length();
-    let mut progress = TransferProgress::start(ui, label, total);
-    write_response_to(url, response, dest, label, &mut progress).await?;
-    progress.finish_ok();
-    Ok(())
+struct DownloadAttempt {
+    streamed_sha256: Option<String>,
 }
 
-async fn download_archive_bar_to(
-    url: &str,
-    label: &str,
-    bar: &ProgressBar,
+async fn download_with_retry(
+    client: &reqwest::Client,
+    plan: &InstallPlan,
     dest: &Path,
+    partial: &Path,
+    ui: TransferUi,
+    shared_bar: Option<&ProgressBar>,
 ) -> Result<(), Error> {
-    let response = match send_get(url).await {
-        Ok(response) => response,
-        Err(err) => {
-            bar.finish_and_clear();
-            return Err(err);
+    let mut last_error = None;
+    for attempt in 0..DOWNLOAD_ATTEMPTS {
+        if attempt > 0 {
+            let shift = attempt - 1;
+            tokio::time::sleep(Duration::from_millis(200 * (1_u64 << shift))).await;
+        }
+        match download_attempt(client, plan, dest, partial, ui, shared_bar).await {
+            Ok(attempt_result) => {
+                let check = if let Some(actual) = attempt_result.streamed_sha256 {
+                    compare_sha256(actual, &plan.sha256)
+                } else {
+                    verify_file_sha256_async(dest.to_path_buf(), plan.sha256.clone()).await
+                };
+                if let Err(err) = check {
+                    let _ = fs::remove_file(dest);
+                    let _ = fs::remove_file(partial);
+                    return Err(err);
+                }
+                return Ok(());
+            }
+            Err(err) if is_retriable(&err) && attempt + 1 < DOWNLOAD_ATTEMPTS => {
+                last_error = Some(err);
+            }
+            Err(err) => {
+                if !is_retriable(&err) {
+                    let _ = fs::remove_file(partial);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| Error::Failed("download failed".into())))
+}
+
+async fn download_attempt(
+    client: &reqwest::Client,
+    plan: &InstallPlan,
+    dest: &Path,
+    partial: &Path,
+    ui: TransferUi,
+    shared_bar: Option<&ProgressBar>,
+) -> Result<DownloadAttempt, Error> {
+    let existing = if partial.is_file() {
+        fs::metadata(partial)?.len()
+    } else {
+        0
+    };
+    let range = if existing > 0 { Some(existing) } else { None };
+    let response = send_get(client, &plan.url, range).await?;
+    let append = existing > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    if append && content_range_start(response.headers()) != Some(existing) {
+        let _ = fs::remove_file(partial);
+        return Err(http_err(&plan.url, "unexpected Content-Range"));
+    }
+    if !append && partial.exists() {
+        fs::remove_file(partial)?;
+    }
+    let (total, initial) = if append {
+        let total = content_range_total(response.headers())
+            .or_else(|| response.content_length().map(|len| existing + len));
+        (total, existing)
+    } else {
+        (response.content_length(), 0)
+    };
+    let mut progress = match shared_bar {
+        Some(bar) => {
+            if let Some(len) = total {
+                bar.set_length(len);
+                bar.set_style(progress_style(Some(len)));
+            }
+            bar.set_message(format!("Downloading {}", plan.filename));
+            bar.set_position(initial);
+            TransferProgress::from_bar(&plan.filename, total, bar.clone(), false)
+        }
+        None => {
+            let mut progress = TransferProgress::start(ui, &plan.filename, total);
+            progress.set_downloaded(initial);
+            progress
         }
     };
-    let total = response.content_length();
-    if let Some(len) = total {
-        bar.set_length(len);
-        bar.set_style(progress_style(Some(len)));
-        bar.set_message(format!("Downloading {label}"));
-    }
-    let mut progress = TransferProgress::from_bar(label, total, bar.clone());
-    write_response_to(url, response, dest, label, &mut progress).await?;
-    progress.finish_ok();
-    Ok(())
-}
-
-async fn write_response_to(
-    url: &str,
-    response: reqwest::Response,
-    dest: &Path,
-    label: &str,
-    progress: &mut TransferProgress,
-) -> Result<(), Error> {
-    let parent = dest
-        .parent()
-        .ok_or_else(|| Error::UnsafeFilename(label.to_string()))?;
+    let parent = partial.parent().ok_or_else(|| Error::UnsafeFilename(plan.filename.clone()))?;
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".partial-{label}-{}-{}",
-        std::process::id(),
-        next_nonce()
-    ));
-    let write_result = write_response_tmp(url, response, &tmp, progress).await;
-    if let Err(err) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(err);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .open(partial)?;
+    if !append {
+        file.set_len(0)?;
     }
-    if let Err(err) = fs::rename(&tmp, dest) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err.into());
-    }
-    Ok(())
-}
-
-async fn write_response_tmp(
-    url: &str,
-    response: reqwest::Response,
-    tmp: &Path,
-    progress: &mut TransferProgress,
-) -> Result<(), Error> {
-    let mut file = fs::File::create(tmp)?;
-    read_chunks_with(
-        url,
+    let mut hasher = if append { None } else { Some(Sha256::new()) };
+    let url = plan.url.clone();
+    let write_result = read_chunks_with(
+        &url,
         response,
         |chunk| {
             file.write_all(chunk)?;
+            if let Some(hasher) = &mut hasher {
+                hasher.update(chunk);
+            }
             Ok(())
         },
-        |downloaded, _| progress.set_downloaded(downloaded),
+        |downloaded, _| progress.set_downloaded(initial + downloaded),
     )
-    .await?;
+    .await;
+    if let Err(err) = write_result {
+        return Err(err);
+    }
     file.sync_all()?;
-    Ok(())
+    drop(file);
+    fs::rename(partial, dest)?;
+    progress.finish_ok();
+    Ok(DownloadAttempt {
+        streamed_sha256: hasher.map(|hasher| hex_encode(&hasher.finalize())),
+    })
+}
+
+fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let rest = value.strip_prefix("bytes ")?;
+    rest.split(['-', '/']).next()?.parse().ok()
+}
+
+fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::CONTENT_RANGE)?.to_str().ok()?;
+    let total = value.rsplit('/').next()?;
+    if total == "*" {
+        return None;
+    }
+    total.parse().ok()
+}
+
+fn is_retriable(err: &Error) -> bool {
+    match err {
+        Error::Http { message, .. } => match http_status_code(message) {
+            Some(code) => (500..600).contains(&code),
+            None => true,
+        },
+        _ => false,
+    }
+}
+
+fn http_status_code(message: &str) -> Option<u16> {
+    let rest = message.strip_prefix("HTTP ")?;
+    let code = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    if code.len() != 3 {
+        return None;
+    }
+    code.parse().ok()
 }
 
 fn http_err(url: &str, message: impl Into<String>) -> Error {
@@ -668,15 +926,16 @@ fn http_err(url: &str, message: impl Into<String>) -> Error {
     }
 }
 
-async fn send_get(url: &str) -> Result<reqwest::Response, Error> {
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("gv/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
-        .timeout(Duration::from_secs(900))
-        .build()
-        .map_err(|err| http_err(url, err.to_string()))?;
-    let response = client
-        .get(url)
+async fn send_get(
+    client: &reqwest::Client,
+    url: &str,
+    range_from: Option<u64>,
+) -> Result<reqwest::Response, Error> {
+    let mut request = client.get(url);
+    if let Some(start) = range_from {
+        request = request.header(reqwest::header::RANGE, format!("bytes={start}-"));
+    }
+    let response = request
         .send()
         .await
         .map_err(|err| http_err(url, err.to_string()))?;
@@ -685,6 +944,22 @@ async fn send_get(url: &str) -> Result<reqwest::Response, Error> {
         return Err(http_err(url, format!("HTTP {status}")));
     }
     Ok(response)
+}
+
+async fn verify_file_sha256_async(path: PathBuf, expected: String) -> Result<(), Error> {
+    tokio::task::spawn_blocking(move || verify_file_sha256(&path, &expected))
+        .await
+        .map_err(|err| Error::Failed(format!("checksum task interrupted: {err}")))?
+}
+
+async fn install_archive_file_async(
+    path: PathBuf,
+    versions_dir: PathBuf,
+    version: String,
+) -> Result<InstallStatus, Error> {
+    tokio::task::spawn_blocking(move || install_archive_file(&path, &versions_dir, &version))
+        .await
+        .map_err(|err| Error::Failed(format!("extract task interrupted: {err}")))?
 }
 
 async fn read_chunks(
@@ -736,11 +1011,12 @@ struct TransferProgress {
     started: Instant,
     bar: Option<ProgressBar>,
     finished: bool,
+    clear_on_drop: bool,
 }
 
 impl TransferProgress {
-    fn start(ui: DownloadUi, label: &str, total: Option<u64>) -> Self {
-        let bar = if ui == DownloadUi::Bar && !ProgressDrawTarget::stderr().is_hidden() {
+    fn start(ui: TransferUi, label: &str, total: Option<u64>) -> Self {
+        let bar = if ui.bar && !ProgressDrawTarget::stderr().is_hidden() {
             Some(make_bar(label, total))
         } else {
             None
@@ -752,6 +1028,7 @@ impl TransferProgress {
             started: Instant::now(),
             bar,
             finished: false,
+            clear_on_drop: true,
         }
     }
 
@@ -762,7 +1039,7 @@ impl TransferProgress {
         }
     }
 
-    fn from_bar(label: &str, total: Option<u64>, bar: ProgressBar) -> Self {
+    fn from_bar(label: &str, total: Option<u64>, bar: ProgressBar, clear_on_drop: bool) -> Self {
         Self {
             label: label.to_string(),
             total,
@@ -770,6 +1047,7 @@ impl TransferProgress {
             started: Instant::now(),
             bar: Some(bar),
             finished: false,
+            clear_on_drop,
         }
     }
 
@@ -793,7 +1071,7 @@ impl TransferProgress {
 
 impl Drop for TransferProgress {
     fn drop(&mut self) {
-        if self.finished {
+        if self.finished || !self.clear_on_drop {
             return;
         }
         if let Some(bar) = &self.bar {
@@ -804,7 +1082,7 @@ impl Drop for TransferProgress {
 
 fn progress_style(total: Option<u64>) -> ProgressStyle {
     let template = if total.is_some() {
-        "{msg} [{bar:32}] {bytes}/{total_bytes} {bytes_per_sec}"
+        "{msg} [{bar:32}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}"
     } else {
         "{msg} {bytes} {bytes_per_sec}"
     };
@@ -904,12 +1182,10 @@ impl Drop for RemoveAll<'_> {
 
 #[cfg(test)]
 pub fn extract_tarball(bytes: &[u8], dest: &Path) -> Result<(), Error> {
-    validate_tarball_reader(std::io::Cursor::new(bytes))?;
     extract_entries(std::io::Cursor::new(bytes), dest)
 }
 
 fn extract_tarball_file(path: &Path, dest: &Path) -> Result<(), Error> {
-    validate_tarball_reader(BufReader::new(fs::File::open(path)?))?;
     extract_entries(BufReader::new(fs::File::open(path)?), dest)
 }
 
@@ -923,25 +1199,11 @@ fn extract_entries(reader: impl BufRead, dest: &Path) -> Result<(), Error> {
         .map_err(|err| Error::BadArchive(err.to_string()))?
     {
         let mut entry = entry.map_err(|err| Error::BadArchive(err.to_string()))?;
-        entry
-            .unpack_in(dest)
-            .map_err(|err| Error::BadArchive(err.to_string()))?;
-    }
-    Ok(())
-}
-
-fn validate_tarball_reader(reader: impl BufRead) -> Result<(), Error> {
-    let decoder = GzDecoder::new(reader);
-    let mut archive = Archive::new(decoder);
-    for entry in archive
-        .entries()
-        .map_err(|err| Error::BadArchive(err.to_string()))?
-    {
-        let entry = entry.map_err(|err| Error::BadArchive(err.to_string()))?;
         let path = entry
             .path()
-            .map_err(|err| Error::BadArchive(err.to_string()))?;
-        check_rel_path(path.as_ref())?;
+            .map_err(|err| Error::BadArchive(err.to_string()))?
+            .into_owned();
+        check_rel_path(&path)?;
         if let Some(link) = entry
             .link_name()
             .map_err(|err| Error::BadArchive(err.to_string()))?
@@ -954,6 +1216,9 @@ fn validate_tarball_reader(reader: impl BufRead) -> Result<(), Error> {
                 path.display()
             )));
         }
+        entry
+            .unpack_in(dest)
+            .map_err(|err| Error::BadArchive(err.to_string()))?;
     }
     Ok(())
 }
@@ -1051,29 +1316,54 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn quiet_ui() -> TransferUi {
+        TransferUi {
+            bar: false,
+            status: false,
+        }
+    }
+
+    fn bar_ui() -> TransferUi {
+        TransferUi {
+            bar: true,
+            status: true,
+        }
+    }
+
     #[test]
     fn quiet_or_non_tty_uses_one_transferred_line() {
-        assert_eq!(download_ui(true, true, Some("xterm")), DownloadUi::Plain);
-        assert_eq!(download_ui(false, false, Some("xterm")), DownloadUi::Plain);
-        assert_eq!(download_ui(false, true, Some("dumb")), DownloadUi::Plain);
-        assert_eq!(download_ui(false, true, None), DownloadUi::Bar);
-        assert_eq!(download_ui(false, true, Some("xterm")), DownloadUi::Bar);
         assert_eq!(
-            progress_render(2, DownloadUi::Bar, false),
-            ProgressRender::Multi
+            transfer_ui(true, true, Some("xterm")),
+            TransferUi {
+                bar: false,
+                status: false,
+            }
         );
         assert_eq!(
-            progress_render(1, DownloadUi::Bar, false),
-            ProgressRender::SingleBar
+            transfer_ui(false, false, Some("xterm")),
+            TransferUi {
+                bar: false,
+                status: true,
+            }
         );
         assert_eq!(
-            progress_render(2, DownloadUi::Bar, true),
-            ProgressRender::Plain
+            transfer_ui(false, true, Some("dumb")),
+            TransferUi {
+                bar: false,
+                status: true,
+            }
         );
+        assert_eq!(transfer_ui(false, true, None), bar_ui());
+        assert_eq!(transfer_ui(false, true, Some("xterm")), bar_ui());
+        assert_eq!(progress_render(2, bar_ui(), false), ProgressRender::Multi);
+        assert_eq!(progress_render(1, bar_ui(), false), ProgressRender::SingleBar);
+        assert_eq!(progress_render(2, bar_ui(), true), ProgressRender::Plain);
+        assert_eq!(progress_render(2, quiet_ui(), false), ProgressRender::Plain);
         assert_eq!(
-            progress_render(2, DownloadUi::Plain, false),
-            ProgressRender::Plain
+            cached_archive_status("go.tar.gz"),
+            "Using cached archive go.tar.gz\n"
         );
+        assert_eq!(extract_status("1.23.4"), "Extracting Go 1.23.4\n");
         assert_eq!(
             format_transferred("go.tar.gz", 100, Some(200), Duration::from_secs(2)),
             "Transferred go.tar.gz 100/200 bytes (50 bytes/sec)\n"
@@ -1103,8 +1393,9 @@ mod tests {
         let body = b"hello-archive-bytes-0123456789";
         let addr = serve_once("200 OK", true, body).await;
         let url = format!("http://{addr}/go1.2.3.linux-amd64.tar.gz");
+        let client = http_client().unwrap();
         let mut updates = Vec::new();
-        let response = send_get(&url).await.unwrap();
+        let response = send_get(&client, &url, None).await.unwrap();
         let bytes = tokio::time::timeout(
             Duration::from_secs(5),
             read_chunks(&url, response, |downloaded, total| {
@@ -1126,7 +1417,7 @@ mod tests {
 
         let addr = serve_once("200 OK", false, body).await;
         let url = format!("http://{addr}/go.tar.gz");
-        let response = send_get(&url).await.unwrap();
+        let response = send_get(&client, &url, None).await.unwrap();
         let mut updates = Vec::new();
         let bytes = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1145,7 +1436,7 @@ mod tests {
         let url = format!("http://{addr}/go.tar.gz");
         let archived = tokio::time::timeout(
             Duration::from_secs(5),
-            download_archive(&url, "go.tar.gz", DownloadUi::Plain),
+            download_archive(&url, "go.tar.gz", quiet_ui()),
         )
         .await
         .expect("plain download timed out")
@@ -1156,7 +1447,7 @@ mod tests {
         let url = format!("http://{addr}/missing.tar.gz");
         let mut called = false;
         let err = tokio::time::timeout(Duration::from_secs(5), async {
-            let response = send_get(&url).await?;
+            let response = send_get(&client, &url, None).await?;
             read_chunks(&url, response, |_, _| called = true).await
         })
         .await
@@ -1194,7 +1485,14 @@ mod tests {
         let cache = root.path().join("archives");
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans_concurrent(plans, Some(multi), &versions, &cache),
+            install_plans_concurrent(
+                &http_client().unwrap(),
+                plans,
+                Some(multi),
+                bar_ui(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("concurrent install timed out");
@@ -1242,7 +1540,7 @@ mod tests {
         let cache = root.path().join("archives");
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans(plans, DownloadUi::Plain, &versions, &cache),
+            install_plans(&http_client().unwrap(), plans, quiet_ui(), &versions, &cache),
         )
         .await
         .expect("concurrent install timed out");
@@ -1282,7 +1580,13 @@ mod tests {
         let versions = root.path().join("versions");
         let results = tokio::time::timeout(
             Duration::from_secs(2),
-            install_plans(vec![plan], DownloadUi::Plain, &versions, &cache),
+            install_plans(
+                &http_client().unwrap(),
+                vec![plan],
+                quiet_ui(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("cached install timed out")
@@ -1314,7 +1618,13 @@ mod tests {
         let versions = root.path().join("versions");
         let results = tokio::time::timeout(
             Duration::from_secs(5),
-            install_plans(vec![plan.clone()], DownloadUi::Plain, &versions, &cache),
+            install_plans(
+                &http_client().unwrap(),
+                vec![plan.clone()],
+                quiet_ui(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("redownload timed out");
@@ -1374,7 +1684,7 @@ mod tests {
         addr
     }
 
-    async fn read_http_headers(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    async fn read_http_headers(socket: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
         let mut buf = Vec::new();
         let mut tmp = [0u8; 1024];
         loop {
@@ -1387,7 +1697,7 @@ mod tests {
                 break;
             }
         }
-        Ok(())
+        Ok(buf)
     }
 
     async fn serve_once(status: &str, content_length: bool, body: &[u8]) -> std::net::SocketAddr {
@@ -1518,7 +1828,22 @@ mod tests {
         );
         let all = filter_remote(&releases, true);
         assert!(all.contains(&"1.23rc1".to_string()));
-        assert_eq!(format_remote(&[]), "No matching remote versions\n");
+        assert_eq!(
+            format_remote(&[]),
+            "No matching remote versions\n"
+        );
+        let mut rows = filter_remote_rows(&releases, false);
+        rows[0].installed = true;
+        let text = format_remote(&rows);
+        assert!(text.starts_with("* 1.23.10\n"), "{text}");
+        assert!(text.contains("\n  1.23.4\n"), "{text}");
+        assert!(remote_version_matches("1.23.10", "1.23"));
+        assert!(!remote_version_matches("1.22.0", "1.23"));
+        assert!(remote_version_matches("1.23.4", "1.23.4"));
+        assert!(!remote_version_matches("1.23.4rc1", "1.23.4"));
+        assert!(remote_version_matches("1.23rc1", "1.23"));
+        assert!(!remote_version_matches("1.23.10", "1.2"));
+        assert!(remote_version_matches("1.23.10", "1.23."));
         let rows = filter_remote_rows(&releases, true);
         assert!(rows
             .iter()
@@ -1532,23 +1857,242 @@ mod tests {
     }
 
     #[test]
-    fn cache_respects_url_and_refresh() {
+    fn cache_respects_url_and_age() {
         let root = TempDir::new();
         let url = "https://example.test/index.json";
-        write_cached_index(
-            root.path(),
-            url,
-            r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#,
-        )
-        .unwrap();
-        let cached = try_cached_index(root.path(), url, false).unwrap().unwrap();
-        assert_eq!(cached[0].version.to_string(), "1.2.3");
-        assert!(try_cached_index(root.path(), "https://other.test", false)
+        let body = r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#;
+        let now = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        write_cached_index_at(root.path(), url, body, now).unwrap();
+        let cached = read_index_cache(root.path(), url, now).unwrap().unwrap();
+        assert_eq!(cached.releases[0].version.to_string(), "1.2.3");
+        assert!(cached.fresh);
+        assert!(read_index_cache(root.path(), "https://other.test", now)
             .unwrap()
             .is_none());
-        assert!(try_cached_index(root.path(), url, true).unwrap().is_none());
-        write_cached_index(root.path(), url, "not-json").unwrap();
-        assert!(try_cached_index(root.path(), url, false).unwrap().is_none());
+        let stale_at = now + INDEX_MAX_AGE;
+        assert!(!read_index_cache(root.path(), url, stale_at).unwrap().unwrap().fresh);
+        write_cached_index_at(root.path(), url, "not-json", now).unwrap();
+        assert!(read_index_cache(root.path(), url, now).unwrap().is_none());
+        assert!(!index_is_fresh(None, now));
+    }
+
+    #[tokio::test]
+    async fn stale_index_stays_offline_and_falls_back_when_refresh_fails() {
+        let root = TempDir::new();
+        let url = "http://127.0.0.1:9/index.json";
+        let body = r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#;
+        write_cached_index_at(root.path(), url, body, std::time::SystemTime::UNIX_EPOCH).unwrap();
+        let client = http_client().unwrap();
+        let now = std::time::SystemTime::now();
+        let stale = load_index(&client, root.path(), url, IndexPolicy::AllowStale, now)
+            .await
+            .unwrap();
+        assert_eq!(stale.releases[0].version.to_string(), "1.2.3");
+        assert!(stale.warning.is_none());
+        assert!(!stale.refresh_attempted);
+
+        let offline = load_index(&client, root.path(), url, IndexPolicy::Offline, now)
+            .await
+            .unwrap();
+        assert_eq!(offline.releases.len(), 1);
+        assert!(offline.warning.is_none());
+
+        let missing = load_index(
+            &client,
+            root.path(),
+            "http://127.0.0.1:9/missing.json",
+            IndexPolicy::Offline,
+            now,
+        )
+        .await
+        .unwrap();
+        assert!(missing.releases.is_empty());
+
+        let fallback = load_index(&client, root.path(), url, IndexPolicy::RefreshIfStale, now)
+            .await
+            .unwrap();
+        assert!(fallback.refresh_attempted);
+        assert!(fallback
+            .warning
+            .unwrap()
+            .contains("Using the cached index"));
+        assert_eq!(fallback.releases[0].version.to_string(), "1.2.3");
+    }
+
+    #[tokio::test]
+    async fn refresh_if_stale_downloads_a_newer_index() {
+        let body = br#"[{"version":"go1.9.0","stable":true,"files":[]}]"#;
+        let addr = serve_once("200 OK", true, body).await;
+        let url = format!("http://{addr}/index.json");
+        let root = TempDir::new();
+        write_cached_index_at(
+            root.path(),
+            &url,
+            r#"[{"version":"go1.2.3","stable":true,"files":[]}]"#,
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        let client = http_client().unwrap();
+        let loaded = load_index(
+            &client,
+            root.path(),
+            &url,
+            IndexPolicy::RefreshIfStale,
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(loaded.releases[0].version.to_string(), "1.9.0");
+        assert!(!loaded.from_cache);
+        assert!(store::cache_dir(root.path()).join("index.fetched").is_file());
+    }
+
+    #[tokio::test]
+    async fn index_request_sends_accept_encoding_gzip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(header) = read_http_headers(&mut socket).await else {
+                return;
+            };
+            let _ = tx.send(String::from_utf8_lossy(&header).to_ascii_lowercase());
+            let body = b"[]";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(body).await;
+        });
+        let client = http_client().unwrap();
+        let bytes = http_get(&client, &format!("http://{addr}/index.json"))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"[]");
+        let header = rx.await.unwrap();
+        assert!(
+            header.contains("accept-encoding:") && header.contains("gzip"),
+            "{header}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resumes_after_a_dropped_connection_and_does_not_retry_404() {
+        let bytes = gz_tar(&[("go/bin/go", b"resumed-sdk")]);
+        let split = bytes.len() / 2;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = bytes.clone();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            if read_http_headers(&mut socket).await.is_err() {
+                return;
+            }
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(&body[..split]).await;
+            drop(socket);
+
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(header) = read_http_headers(&mut socket).await else {
+                return;
+            };
+            let header = String::from_utf8_lossy(&header).to_ascii_lowercase();
+            if !header.contains(&format!("range: bytes={split}-")) {
+                return;
+            }
+            let rest = &body[split..];
+            let end = body.len() - 1;
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {split}-{end}/{len}\r\nContent-Length: {rest_len}\r\nConnection: close\r\n\r\n",
+                len = body.len(),
+                rest_len = rest.len()
+            );
+            if socket.write_all(response.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(rest).await;
+        });
+
+        let root = TempDir::new();
+        let plan = plan_for(
+            "1.2.3",
+            &bytes,
+            &format!("http://{addr}/go1.2.3.linux-amd64.tar.gz"),
+        );
+        let cache = root.path().join("archives");
+        let versions = root.path().join("versions");
+        let client = http_client().unwrap();
+        let results = tokio::time::timeout(
+            Duration::from_secs(8),
+            install_plans(&client, vec![plan], quiet_ui(), &versions, &cache),
+        )
+        .await
+        .expect("resume timed out");
+        assert!(
+            matches!(results[0], Ok((ref version, InstallStatus::Installed)) if version == "1.2.3"),
+            "{results:?}"
+        );
+        assert_eq!(
+            fs::read(versions.join("1.2.3/go/bin/go")).unwrap(),
+            b"resumed-sdk"
+        );
+        let leftovers: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".partial-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits_task = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                hits_task.fetch_add(1, Ordering::SeqCst);
+                if read_http_headers(&mut socket).await.is_err() {
+                    return;
+                }
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let missing = plan_for(
+            "1.2.4",
+            b"unused",
+            &format!("http://{addr}/missing.tar.gz"),
+        );
+        let failed = tokio::time::timeout(
+            Duration::from_secs(5),
+            install_plans(&client, vec![missing], quiet_ui(), &versions, &cache),
+        )
+        .await
+        .expect("404 timed out");
+        assert!(
+            matches!(failed[0], Err((ref version, Error::Http { .. })) if version == "1.2.4"),
+            "{failed:?}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::error::Error;
     about = "Go version manager",
     subcommand_required = true,
     arg_required_else_help = true,
-    after_long_help = "Examples:\n  gv install 1.23.4\n  gv install latest\n  gv install 1.22.5 1.23.4\n  gv uninstall 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --unset\n  gv use --global 1.23.4\n  gv use --global --unset\n  gv which\n  gv clean\n  eval \"$(gv init bash)\"\n  eval \"$(gv completions bash)\"\n  eval \"$(gv shell 1.23.4)\""
+    after_long_help = "Examples:\n  gv install 1.23.4\n  gv install latest\n  gv install 1.22.5 1.23.4\n  gv uninstall 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --unset\n  gv use --global 1.23.4\n  gv use --global --unset\n  gv list-remote 1.23\n  gv list-remote --offline\n  gv which\n  gv clean\n  eval \"$(gv init bash)\"\n  eval \"$(gv completions bash)\"\n  eval \"$(gv shell 1.23.4)\""
 )]
 struct Cli {
     #[command(subcommand)]
@@ -66,11 +66,17 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// Ignore the local cache and download the index again
-        #[arg(long)]
+        #[arg(long, conflicts_with = "offline")]
         refresh: bool,
+        /// Use the cached index and do not download
+        #[arg(long, conflicts_with = "refresh")]
+        offline: bool,
         /// Output format: text or json
         #[arg(long, value_enum, default_value = "text")]
         output: commands::list::OutputFormat,
+        /// Show versions for this minor, exact version, or prefix
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
     },
     /// Select a Go version
     Use {
@@ -145,9 +151,18 @@ fn run() -> Result<(), Error> {
         Command::ListRemote {
             all,
             refresh,
+            offline,
             output,
+            prefix,
         } => {
-            block_on(commands::list::remote(&root, all, refresh, output))?;
+            block_on(commands::list::remote(
+                &root,
+                all,
+                refresh,
+                offline,
+                prefix.as_deref(),
+                output,
+            ))?;
         }
         Command::Use {
             version,

@@ -529,10 +529,16 @@ fn go_os_arch() -> (&'static str, &'static str) {
 }
 
 fn seed_index(root: &Path, body: &str) {
+    seed_index_at(root, body, SystemTime::now());
+}
+
+fn seed_index_at(root: &Path, body: &str, fetched: SystemTime) {
     let cache = root.join("cache");
     fs::create_dir_all(&cache).unwrap();
     fs::write(cache.join("index.json"), body).unwrap();
     fs::write(cache.join("index.url"), "http://127.0.0.1:9/index.json\n").unwrap();
+    let secs = fetched.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    fs::write(cache.join("index.fetched"), format!("{secs}\n")).unwrap();
 }
 
 fn sample_remote_index() -> String {
@@ -782,7 +788,10 @@ fn list_remote_json_reports_stable_from_cache() {
         "{}",
         String::from_utf8_lossy(&text.stderr)
     );
-    assert_eq!(String::from_utf8(text.stdout).unwrap(), "1.24.0\n1.22.5\n");
+    assert_eq!(
+        String::from_utf8(text.stdout).unwrap(),
+        "  1.24.0\n  1.22.5\n"
+    );
 
     let json = gv(root.path())
         .current_dir(cwd.path())
@@ -801,6 +810,43 @@ fn list_remote_json_reports_stable_from_cache() {
     assert!(stdout.contains("\"stable\":true") || stdout.contains("\"stable\": true"));
     assert!(stdout.contains("1.25rc1"));
     assert!(stdout.contains("\"stable\":false") || stdout.contains("\"stable\": false"));
+    assert!(stdout.contains("\"installed\":false") || stdout.contains("\"installed\": false"));
+}
+
+#[test]
+fn list_remote_filters_and_marks_installed_versions() {
+    let root = TempDir::new();
+    seed_index(root.path(), &sample_remote_index());
+    install_fake_sdk(root.path(), "1.24.0");
+
+    let exact = gv(root.path()).args(["list-remote", "1.24"]).output().unwrap();
+    assert!(exact.status.success(), "{}", String::from_utf8_lossy(&exact.stderr));
+    assert_eq!(String::from_utf8(exact.stdout).unwrap(), "* 1.24.0\n");
+
+    let minor = gv(root.path()).args(["list-remote", "1.22"]).output().unwrap();
+    assert!(minor.status.success(), "{}", String::from_utf8_lossy(&minor.stderr));
+    assert_eq!(String::from_utf8(minor.stdout).unwrap(), "  1.22.5\n");
+}
+
+#[test]
+fn list_remote_offline_uses_a_stale_cache_without_a_warning() {
+    let root = TempDir::new();
+    seed_index_at(root.path(), &sample_remote_index(), UNIX_EPOCH);
+    let started = std::time::Instant::now();
+    let text = gv(root.path())
+        .args(["list-remote", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "offline list-remote contacted the network"
+    );
+    assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+    assert!(text.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(text.stdout).unwrap(),
+        "  1.24.0\n  1.22.5\n"
+    );
 }
 
 #[test]

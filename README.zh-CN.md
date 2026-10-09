@@ -113,7 +113,7 @@ eval "$(gv shell 1.23.4)"
 | `gv install <version> [version...]` | 查询索引、下载、校验 SHA256 并解压。一次传入多个版本时会同时下载。已经安装的版本会跳过，并给出说明。在终端里，每个正在下载的版本各有一条进度条。使用 `--quiet`、非终端，或 `TERM=dumb` 时，每个版本在下载结束后打印一行已传输字节数。某个版本失败时，其余版本仍会装完；每条失败都会打印，命令以非零状态退出。`latest` 表示索引中按数值排序最高的稳定补丁，可以和其他版本一起用，例如 `gv install latest 1.22.5`。若它已经安装，命令会跳过并以成功状态退出。`latest` 只用于 install |
 | `gv uninstall <version> [version...]` | 按顺序删除这些 SDK。未安装的版本会逐个报告，命令继续执行。若全局文件指向其中某个版本，除非加上 `--force`，否则拒绝卸载该版本。`--force` 作用于整条命令，并会清除全局文件。某个版本失败时，其余版本仍会卸载；每条失败都会打印，命令以非零状态退出 |
 | `gv list` | 列出已安装版本，并用 `*` 标出当前解析结果。`--output json` 改为机器可读输出，包含已安装版本和当前解析结果。默认仍是文本 |
-| `gv list-remote` | 列出稳定版本。`--all` 包含 beta、rc 等历史版本。`--refresh` 强制刷新索引。`--output json` 会带上每个版本是否稳定。文本输出不变 |
+| `gv list-remote [前缀]` | 列出稳定版本。`--all` 包含 beta、rc 等历史版本。`--refresh` 强制刷新索引。`--offline` 只用缓存，即使缓存过期也不下载。`--refresh` 和 `--offline` 不能同时使用。前缀用来过滤：`1.23` 保留这个小版本，`1.23.4` 只保留这个精确版本，其他文本按显示出来的版本字符串做前缀匹配。文本里已安装的版本用 `*` 标出，其余版本前面是两个空格。`--output json` 会带上每个版本是否稳定、是否已安装 |
 | `gv use <version>` | 在当前目录写入 `.go-version` |
 | `gv use --global <version>` | 写入全局版本文件 |
 | `gv use --unset` | 删除当前目录的 `.go-version`。文件不存在时说明这一点并以成功状态退出 |
@@ -121,7 +121,7 @@ eval "$(gv shell 1.23.4)"
 | `gv current` | 打印当前生效的版本及其来源 |
 | `gv which` | 打印当前解析结果、来源，以及 `go` 和 `gofmt` 的路径。版本未安装时建议运行 `gv install` |
 | `gv init bash` / `gv init zsh` | 打印可供 `eval` 的初始化片段 |
-| `gv completions bash` / `gv completions zsh` | 打印补全脚本，补全子命令和已安装版本 |
+| `gv completions bash` / `gv completions zsh` | 打印补全脚本，补全子命令和已安装版本。`gv install` 还会补全缓存索引里的版本。补全通过 `gv list-remote --offline` 读取索引，不会下载 |
 | `gv clean` | 删除缓存的压缩包。不会删除 `versions/` 或索引缓存 |
 | `gv shell <version>` | 打印 `export GV_VERSION=<version>`。`--unset` 打印 `unset GV_VERSION` |
 
@@ -137,6 +137,7 @@ eval "$(gv shell 1.23.4)"
   cache/
     index.json
     index.url
+    index.fetched
     archives/
 ```
 
@@ -151,13 +152,13 @@ eval "$(gv shell 1.23.4)"
 | `GV_MIRROR` | 压缩包 URL 前缀，默认 `https://go.dev/dl`。例如 `https://mirrors.aliyun.com/golang` |
 | `GV_INDEX_URL` | 版本索引，默认 `https://go.dev/dl/?mode=json&include=all` |
 
-索引缓存在 `$GV_ROOT/cache`。压缩包缓存在 `$GV_ROOT/cache/archives/`。校验和只使用索引 JSON 里的 `sha256` 字段，不使用压缩包旁边的校验文件。
+索引缓存在 `$GV_ROOT/cache`。`index.fetched` 记录这份缓存的写入时间，单位是 Unix 秒。`gv list-remote`、`gv install latest`，以及 `1.23` 这种小版本，会在缓存缺失、超过 24 小时或没有写入时间时重新下载索引。`gv install 1.23.4` 这种精确版本会继续使用能解析的缓存，只有请求的版本不在缓存里时才刷新。刷新失败但缓存仍可读时，gv 使用缓存并打印一行警告。`gv list-remote --offline` 从不下载。压缩包缓存在 `$GV_ROOT/cache/archives/`。校验和只使用索引 JSON 里的 `sha256` 字段，不使用压缩包旁边的校验文件。
 
 ## 下载与解压
 
 压缩包是顶层目录为 `go/` 的 `.tar.gz`。每个版本先写入 `$GV_ROOT/cache/archives/`。缓存文件的 SHA256 与索引一致时会直接复用。校验通过后解压到临时目录。校验失败会删除该缓存文件。
 
-下载时，终端会显示已传输字节和速度。stderr 不是终端、`TERM=dumb`，或传入 `--quiet` 时，不画进度条，下载结束后打印一行已传输字节数。一次安装多个版本时会同时下载这些压缩包：终端为每个版本显示一条进度条，非终端则为每个版本打印一行已传输字节数。
+下载时，终端会显示已传输字节、速度和预计剩余时间。stderr 不是终端、`TERM=dumb`，或传入 `--quiet` 时，不画进度条，下载结束后打印一行已传输字节数。未使用 `--quiet` 时，命中缓存会打印 `Using cached archive <filename>`，解压前会打印 `Extracting Go <version>`。一次安装多个版本时会同时下载这些压缩包，最多同时 3 个：终端为每个版本显示一条进度条，非终端则为每个版本打印一行已传输字节数。传输中断时会保留 `cache/archives/.partial-<filename>`，并再试两次，间隔 200ms 和 400ms。重试只覆盖连接失败、超时和 HTTP 5xx。服务器返回 `206` 时从已保存的字节继续。校验失败、HTTP 404 和不安全路径不会重试。只新装了一个版本、且它不是当前生效版本时，gv 会提示运行 `gv use <version>`。
 
 包含 `..` 的路径、绝对路径或不安全的链接目标会被拒绝。通过这些检查之后，临时目录才会原子地重命名为 `versions/<version>`。`gv clean` 只删除 `cache/archives/` 里的压缩包。
 

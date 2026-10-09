@@ -113,7 +113,7 @@ The first match wins:
 | `gv install <version> [version...]` | Look up the index, download, verify SHA256, and extract. Several versions passed together are downloaded at the same time. Versions that are already installed are skipped, with a note. In a terminal, each version being downloaded has its own progress bar. With `--quiet`, a non-terminal, or `TERM=dumb`, each version prints one line of transferred bytes when it finishes. If one version fails, the others still finish installing, each failure is printed, and the command exits non-zero. `latest` means the highest stable patch in the index by numeric order, and it can be combined with other versions, for example `gv install latest 1.22.5`. If it is already installed, the command skips it and exits successfully. `latest` is only for install |
 | `gv uninstall <version> [version...]` | Delete these SDKs in order. Versions that are not installed are reported one by one, and the command continues. If the global file points at one of them, that version is refused unless `--force` is set. `--force` applies to the whole command and also clears the global file. If one version fails, the others still uninstall, each failure is printed, and the command exits non-zero |
 | `gv list` | List installed versions and mark the current resolution with `*`. `--output json` switches to machine-readable output that includes the installed versions and the current resolution. The default is still text |
-| `gv list-remote` | List stable versions. `--all` includes historical versions such as beta and rc. `--refresh` forces an index refresh. `--output json` includes whether each version is stable. Text output is unchanged |
+| `gv list-remote [prefix]` | List stable versions. `--all` includes historical versions such as beta and rc. `--refresh` forces an index refresh. `--offline` uses the cache and does not download, including when the cache is stale. `--refresh` and `--offline` cannot be combined. A prefix filters the list: `1.23` keeps that minor, `1.23.4` keeps that exact version, and any other text is a prefix of the displayed version. Text marks an installed version with `*` and leaves two spaces before the others. `--output json` includes whether each version is stable and installed |
 | `gv use <version>` | Write `.go-version` in the current directory |
 | `gv use --global <version>` | Write the global version file |
 | `gv use --unset` | Remove `.go-version` in the current directory. If it is absent, say so and exit successfully |
@@ -121,7 +121,7 @@ The first match wins:
 | `gv current` | Print the active version and its source |
 | `gv which` | Print the current resolution, its source, and the paths of `go` and `gofmt`. If the version is not installed, suggest `gv install` |
 | `gv init bash` / `gv init zsh` | Print an init snippet that can be `eval`ed |
-| `gv completions bash` / `gv completions zsh` | Print a completion script for subcommands and installed versions |
+| `gv completions bash` / `gv completions zsh` | Print a completion script for subcommands, installed versions, and, for `gv install`, versions in the cached index. Completion reads that index with `gv list-remote --offline` and does not download |
 | `gv clean` | Delete cached archives. It does not delete `versions/` or the index cache |
 | `gv shell <version>` | Print `export GV_VERSION=<version>`. `--unset` prints `unset GV_VERSION` |
 
@@ -137,6 +137,7 @@ The first match wins:
   cache/
     index.json
     index.url
+    index.fetched
     archives/
 ```
 
@@ -151,13 +152,13 @@ The final SDK layout is `versions/<version>/go/bin/go`.
 | `GV_MIRROR` | Archive URL prefix, default `https://go.dev/dl`. For example `https://mirrors.aliyun.com/golang` |
 | `GV_INDEX_URL` | Version index, default `https://go.dev/dl/?mode=json&include=all` |
 
-The index is cached in `$GV_ROOT/cache`. Archives are cached in `$GV_ROOT/cache/archives/`. Checksums use only the `sha256` field in the index JSON, not a checksum file next to the archive.
+The index is cached in `$GV_ROOT/cache`. `index.fetched` is the Unix time when that cache was written. `gv list-remote`, `gv install latest`, and a minor version such as `1.23` download a new index when the cache is missing, older than 24 hours, or has no fetch time. An exact install such as `gv install 1.23.4` keeps a parseable cache and refreshes only when that version is not in it. If a refresh fails and a cache is still readable, gv uses the cache and prints a warning. `gv list-remote --offline` never downloads. Archives are cached in `$GV_ROOT/cache/archives/`. Checksums use only the `sha256` field in the index JSON, not a checksum file next to the archive.
 
 ## Download and extract
 
 Archives are `.tar.gz` files whose top-level directory is `go/`. Each version is written to `$GV_ROOT/cache/archives/` first. A cached file whose SHA256 matches the index is reused. After the checksum passes, it is extracted into a temporary directory. A failed check deletes that cache file.
 
-During a download, a terminal shows transferred bytes and speed. When stderr is not a terminal, `TERM=dumb`, or `--quiet` is passed, no progress bar is drawn and one line of transferred bytes is printed after the download finishes. Installing several versions downloads those archives at the same time: a terminal shows a progress bar for each, and a non-terminal prints one line of transferred bytes per version.
+During a download, a terminal shows transferred bytes, speed, and the estimated time remaining. When stderr is not a terminal, `TERM=dumb`, or `--quiet` is passed, no progress bar is drawn and one line of transferred bytes is printed after the download finishes. Unless `--quiet` is set, a cache hit prints `Using cached archive <filename>` and extraction prints `Extracting Go <version>`. Installing several versions downloads those archives at the same time, at most three at once: a terminal shows a progress bar for each, and a non-terminal prints one line of transferred bytes per version. A transfer that stops early keeps `cache/archives/.partial-<filename>` and retries twice, after 200ms and then 400ms. Retries cover connection failures, timeouts, and HTTP 5xx. A `206` response continues from the bytes already stored. Checksum failures, HTTP 404, and unsafe paths are not retried. When one new version is installed and it is not the version currently in effect, gv suggests `gv use <version>`.
 
 Paths containing `..`, absolute paths, or unsafe link targets are refused. Only then is the temporary directory atomically renamed to `versions/<version>`. `gv clean` deletes only the archives in `cache/archives/`.
 

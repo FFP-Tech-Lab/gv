@@ -1,6 +1,7 @@
 use std::path::Path;
+use std::time::SystemTime;
 
-use crate::download::{self, InstallPlan, InstallStatus};
+use crate::download::{self, IndexPolicy, InstallPlan, InstallStatus, LoadedIndex};
 use crate::error::Error;
 use crate::platform::Platform;
 use crate::resolve::{self, Version, VersionQuery};
@@ -25,11 +26,12 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
     let platform = Platform::current()?;
     let mirror = store::mirror_url();
     let url = store::index_url();
-    let mut loaded = download::load_index(root, &url, false).await?;
+    let client = download::http_client()?;
+    let mut loaded = load_for_install(&client, root, &url, policy_for(&query)).await?;
     let plan = match download::plan_install(&loaded.releases, requested, &platform, &mirror) {
         Ok(plan) => plan,
-        Err(Error::VersionNotInIndex(_)) | Err(Error::NoArchive { .. }) if loaded.from_cache => {
-            loaded = download::load_index(root, &url, true).await?;
+        Err(err) if should_refresh(&err, &loaded) => {
+            loaded = load_for_install(&client, root, &url, IndexPolicy::Refresh).await?;
             download::plan_install(&loaded.releases, requested, &platform, &mirror)?
         }
         Err(err) => return Err(err),
@@ -44,14 +46,18 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
     let versions_dir = store::versions_dir(root);
     let cache_dir = store::archive_cache_dir(root);
     let results = download::install_plans(
+        &client,
         vec![plan],
-        download::download_ui_for(quiet),
+        download::transfer_ui_for(quiet),
         &versions_dir,
         &cache_dir,
     )
     .await;
     match results.into_iter().next() {
-        Some(Ok((_, InstallStatus::Installed))) => println!("Installed Go {version}"),
+        Some(Ok((_, InstallStatus::Installed))) => {
+            println!("Installed Go {version}");
+            hint_if_unused(root, &version);
+        }
         Some(Ok((_, InstallStatus::AlreadyPresent))) => {
             println!("Go {version} is already installed")
         }
@@ -106,7 +112,18 @@ async fn install_pending(
     let platform = Platform::current()?;
     let mirror = store::mirror_url();
     let url = store::index_url();
-    let loaded = download::load_index(root, &url, false).await?;
+    let client = download::http_client()?;
+    let policy = if pending.iter().any(|spec| {
+        matches!(
+            resolve::parse_install_spec(spec),
+            Ok(VersionQuery::Minor { .. } | VersionQuery::Latest)
+        )
+    }) {
+        IndexPolicy::RefreshIfStale
+    } else {
+        IndexPolicy::AllowStale
+    };
+    let loaded = load_for_install(&client, root, &url, policy).await?;
     let mut failures = Vec::new();
     let mut plans = Vec::new();
     let mut seen: Vec<Version> = Vec::new();
@@ -115,9 +132,7 @@ async fn install_pending(
     for spec in pending {
         match download::plan_install(&loaded.releases, spec, &platform, &mirror) {
             Ok(plan) => queue_plan(&mut plans, &mut seen, root, plan),
-            Err(Error::VersionNotInIndex(_)) | Err(Error::NoArchive { .. })
-                if loaded.from_cache =>
-            {
+            Err(err) if should_refresh(&err, &loaded) => {
                 refresh_needed.push(spec.clone());
             }
             Err(err) => failures.push(format!("Failed to install Go {spec}: {err}")),
@@ -125,7 +140,7 @@ async fn install_pending(
     }
 
     if !refresh_needed.is_empty() {
-        match download::load_index(root, &url, true).await {
+        match load_for_install(&client, root, &url, IndexPolicy::Refresh).await {
             Ok(fresh) => {
                 for spec in refresh_needed {
                     match download::plan_install(&fresh.releases, &spec, &platform, &mirror) {
@@ -146,8 +161,9 @@ async fn install_pending(
     let versions_dir = store::versions_dir(root);
     let cache_dir = store::archive_cache_dir(root);
     for item in download::install_plans(
+        &client,
         plans,
-        download::download_ui_for(quiet),
+        download::transfer_ui_for(quiet),
         &versions_dir,
         &cache_dir,
     )
@@ -162,6 +178,45 @@ async fn install_pending(
         }
     }
     Ok(failures)
+}
+
+fn policy_for(query: &VersionQuery) -> IndexPolicy {
+    match query {
+        VersionQuery::Exact(_) => IndexPolicy::AllowStale,
+        VersionQuery::Minor { .. } | VersionQuery::Latest => IndexPolicy::RefreshIfStale,
+    }
+}
+
+async fn load_for_install(
+    client: &reqwest::Client,
+    root: &Path,
+    url: &str,
+    policy: IndexPolicy,
+) -> Result<LoadedIndex, Error> {
+    let loaded = download::load_index(client, root, url, policy, SystemTime::now()).await?;
+    if let Some(warning) = &loaded.warning {
+        eprintln!("gv: {warning}");
+    }
+    Ok(loaded)
+}
+
+fn should_refresh(err: &Error, loaded: &LoadedIndex) -> bool {
+    matches!(err, Error::VersionNotInIndex(_) | Error::NoArchive { .. })
+        && loaded.from_cache
+        && !loaded.refresh_attempted
+}
+
+fn hint_if_unused(root: &Path, version: &str) {
+    let Ok(cwd) = std::env::current_dir() else {
+        eprintln!("gv: To use it in this directory, run gv use {version}");
+        return;
+    };
+    let gv_version = std::env::var("GV_VERSION").ok();
+    let active = resolve::resolve(&cwd, root, gv_version.as_deref()).ok();
+    if active.is_some_and(|resolved| resolved.version.to_string() == version) {
+        return;
+    }
+    eprintln!("gv: To use it in this directory, run gv use {version}");
 }
 
 fn queue_plan(

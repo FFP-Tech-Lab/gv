@@ -192,14 +192,24 @@ pub fn installed_versions(root: &Path) -> Result<Vec<Version>, Error> {
 }
 
 pub fn resolve(cwd: &Path, root: &Path, gv_version: Option<&str>) -> Result<Resolved, Error> {
+    resolve_using(cwd, root, gv_version, None)
+}
+
+/// Resolve using an already-scanned install list. `gv list` passes that list so it does not scan `versions/` twice.
+pub fn resolve_using(
+    cwd: &Path,
+    root: &Path,
+    gv_version: Option<&str>,
+    installed: Option<&[Version]>,
+) -> Result<Resolved, Error> {
     if let Some(raw) = gv_version {
         let raw = raw.trim();
         if !raw.is_empty() {
-            return activate(parse_user_spec(raw)?, Origin::Env, root);
+            return activate(parse_user_spec(raw)?, Origin::Env, root, installed);
         }
     }
     if let Some((path, text)) = find_project_pin(cwd)? {
-        return activate(parse_user_spec(&text)?, Origin::Project(path), root);
+        return activate(parse_user_spec(&text)?, Origin::Project(path), root, installed);
     }
     let global = store::global_version_path(root);
     if global.is_file() {
@@ -207,14 +217,39 @@ pub fn resolve(cwd: &Path, root: &Path, gv_version: Option<&str>) -> Result<Reso
         if text.is_empty() {
             return Err(Error::EmptyVersionFile(global));
         }
-        return activate(parse_user_spec(&text)?, Origin::Global(global), root);
+        return activate(parse_user_spec(&text)?, Origin::Global(global), root, installed);
     }
     Err(Error::NoVersion)
 }
 
-fn activate(query: VersionQuery, origin: Origin, root: &Path) -> Result<Resolved, Error> {
-    let installed = installed_versions(root)?;
-    let version = select_installed(&query, &installed)?;
+fn activate(
+    query: VersionQuery,
+    origin: Origin,
+    root: &Path,
+    installed: Option<&[Version]>,
+) -> Result<Resolved, Error> {
+    let version = match &query {
+        VersionQuery::Exact(version) => {
+            if let Some(installed) = installed {
+                select_installed(&query, installed)?
+            } else if store::tool_exists(root, &version.to_string(), "go") {
+                version.clone()
+            } else {
+                return Err(Error::NotInstalled(version.to_string()));
+            }
+        }
+        VersionQuery::Minor { .. } => {
+            let owned;
+            let installed = if let Some(installed) = installed {
+                installed
+            } else {
+                owned = installed_versions(root)?;
+                &owned
+            };
+            select_installed(&query, installed)?
+        }
+        VersionQuery::Latest => return Err(Error::BadVersion("latest".to_string())),
+    };
     Ok(Resolved { version, origin })
 }
 
@@ -477,6 +512,26 @@ mod tests {
             err.to_string(),
             "Go 1.2.3 is not installed. Run gv install 1.2.3"
         );
+    }
+
+    #[test]
+    fn exact_version_uses_its_own_sdk_and_a_supplied_list() {
+        let root = TempDir::new();
+        let project = TempDir::new();
+        touch_sdk(root.path(), "1.2.3");
+        touch_sdk(root.path(), "9.9.9");
+        fs::write(project.path().join(".go-version"), "1.2.3\n").unwrap();
+
+        let resolved = resolve(project.path(), root.path(), None).unwrap();
+        assert_eq!(resolved.version.to_string(), "1.2.3");
+
+        let installed = installed_versions(root.path()).unwrap();
+        let from_list =
+            resolve_using(project.path(), root.path(), None, Some(&installed)).unwrap();
+        assert_eq!(from_list.version.to_string(), "1.2.3");
+
+        let err = resolve_using(project.path(), root.path(), None, Some(&[])).unwrap_err();
+        assert_eq!(err.to_string(), "Go 1.2.3 is not installed. Run gv install 1.2.3");
     }
 
     #[test]
