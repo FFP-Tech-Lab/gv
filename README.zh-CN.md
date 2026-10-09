@@ -43,13 +43,13 @@
 ## 安装
 
 ```bash
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | sh
 ```
 
-也可以在本地构建：
+二进制安装到 `~/.gv/bin/gv`。`GV_RELEASE` 用来选择已发布的 tag。带前导 `v` 和不带前导 `v` 的值指向同一个 tag。`GV_RELEASE=0.1.0` 安装的是 `v0.1.0`。
 
 ```bash
-cargo build --release
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_RELEASE=0.1.0 sh
 ```
 
 第一次运行任意 `gv` 子命令时，会准备下面的目录。`shims/go` 和 `shims/gofmt` 是指向 `gv` 的符号链接。程序名是 `go` 或 `gofmt` 时，`gv` 会解析版本，然后执行 `$GV_ROOT/versions/<version>/go/bin/` 下的真实二进制。执行前会去掉已有的 `GOROOT`；只有在 `GOTOOLCHAIN` 未设置时，才把它设为 `local`。
@@ -162,18 +162,11 @@ eval "$(gv shell 1.23.4)"
 
 包含 `..` 的路径、绝对路径或不安全的链接目标会被拒绝。通过这些检查之后，临时目录才会原子地重命名为 `versions/<version>`。`gv clean` 只删除 `cache/archives/` 里的压缩包。
 
-## 当前版本不做的事
-
-- Windows
-- fish 与 PowerShell
-- 自动修改 shell 配置
-- 从 `go.mod` 的 `toolchain` 行选择版本
-- 调用系统里已经安装的 `go` 二进制
-
 ## 开发
 
 ```bash
 cargo test
+cargo build --release
 ```
 
 测试不会访问网络。`rust-toolchain.toml` 将 Rust 固定为 1.99，当前依赖需要这个版本。程序本身使用 Rust edition 2021。
