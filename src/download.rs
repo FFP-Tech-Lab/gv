@@ -792,6 +792,8 @@ async fn download_and_install(
             finish_bar(bar, tone, &message, present.color());
         } else if let Some(activity) = fetched.activity {
             activity.finish(tone, &message);
+        } else {
+            present.finish(tone, &message);
         }
     }
     Ok(status)
