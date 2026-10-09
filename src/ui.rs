@@ -153,10 +153,10 @@ impl Activity {
             Some(thread::spawn(move || {
                 let (lock, cv) = &*thread_shared;
                 let guard = lock.lock().expect("activity lock");
-                let (mut guard, result) = cv
-                    .wait_timeout(guard, SPINNER_DELAY)
+                let (mut guard, _) = cv
+                    .wait_timeout_while(guard, SPINNER_DELAY, |shared| !shared.done)
                     .expect("activity wait");
-                if guard.done || !result.timed_out() {
+                if guard.done {
                     return;
                 }
                 let bar = ProgressBar::with_draw_target(None, ProgressDrawTarget::stderr());
@@ -234,6 +234,8 @@ impl Drop for Activity {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -310,6 +312,24 @@ mod tests {
         );
         assert_eq!(format_result_line(Tone::Notice, "skip", true), "• skip");
         assert_eq!(format_result(Tone::Done, "ok", false), "✔ ok\n");
+    }
+
+    #[test]
+    fn finish_before_spinner_returns_immediately() {
+        let started = Instant::now();
+        let activity = Activity::begin(
+            UiMode {
+                animated: true,
+                color: false,
+            },
+            "working",
+        );
+        activity.finish(Tone::Failed, "unused");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "early finish took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
