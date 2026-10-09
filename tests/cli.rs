@@ -513,3 +513,364 @@ fn shim_execs_sdk_and_controls_goroot_and_gotoolchain() {
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("gv install 9.9.9"));
 }
+
+fn go_os_arch() -> (&'static str, &'static str) {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" | "darwin" => "darwin",
+        other => other,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" | "amd64" => "amd64",
+        "aarch64" | "arm64" => "arm64",
+        other => other,
+    };
+    (os, arch)
+}
+
+fn seed_index(root: &Path, body: &str) {
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("index.json"), body).unwrap();
+    fs::write(cache.join("index.url"), "http://127.0.0.1:9/index.json\n").unwrap();
+}
+
+fn sample_remote_index() -> String {
+    let (os, arch) = go_os_arch();
+    format!(
+        r#"[
+          {{"version":"go1.22.5","stable":true,"files":[{{"filename":"go1.22.5.{os}-{arch}.tar.gz","os":"{os}","arch":"{arch}","sha256":"abc","kind":"archive"}}]}},
+          {{"version":"go1.24.0","stable":true,"files":[{{"filename":"go1.24.0.{os}-{arch}.tar.gz","os":"{os}","arch":"{arch}","sha256":"def","kind":"archive"}}]}},
+          {{"version":"go1.25rc1","stable":false,"files":[{{"filename":"go1.25rc1.{os}-{arch}.tar.gz","os":"{os}","arch":"{arch}","sha256":"ghi","kind":"archive"}}]}}
+        ]"#
+    )
+}
+
+#[test]
+fn which_prints_source_and_tool_paths() {
+    let root = TempDir::new();
+    let project = TempDir::new();
+    install_fake_sdk(root.path(), "1.23.0");
+    install_fake_sdk(root.path(), "1.23.10");
+    let used = gv(root.path())
+        .current_dir(project.path())
+        .args(["use", "1.23"])
+        .output()
+        .unwrap();
+    assert!(used.status.success());
+
+    let output = gv(root.path())
+        .current_dir(project.path())
+        .arg("which")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("1.23.10（.go-version:"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("versions/1.23.10/go/bin/go")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("versions/1.23.10/go/bin/gofmt"), "{stdout}");
+
+    let missing = gv(root.path())
+        .current_dir(project.path())
+        .env("GV_VERSION", "9.9.9")
+        .arg("which")
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("gv install 9.9.9"));
+}
+
+#[test]
+fn completions_are_print_only() {
+    let root = TempDir::new();
+    let bash = gv(root.path())
+        .args(["completions", "bash"])
+        .output()
+        .unwrap();
+    assert!(bash.status.success());
+    let text = String::from_utf8(bash.stdout).unwrap();
+    assert!(text.contains("install"));
+    assert!(text.contains("list-remote"));
+    assert!(text.contains("gv list"));
+    assert!(text.contains("latest"));
+    assert!(text.contains("不会修改 ~/.bashrc"));
+    assert!(!text.contains("cd "));
+    assert!(!text.contains(">>"));
+
+    let zsh = gv(root.path())
+        .args(["completions", "zsh"])
+        .output()
+        .unwrap();
+    assert!(zsh.status.success());
+    let text = String::from_utf8(zsh.stdout).unwrap();
+    assert!(text.contains("不会修改 ~/.zshrc"));
+    assert!(text.contains("gv list"));
+    assert!(!text.contains("cd "));
+
+    let fish = gv(root.path())
+        .args(["completions", "fish"])
+        .output()
+        .unwrap();
+    assert!(!fish.status.success());
+    assert!(String::from_utf8_lossy(&fish.stderr).contains("bash"));
+}
+
+#[test]
+fn shell_prints_export_or_unset() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    let export = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["shell", "go1.23.4"])
+        .output()
+        .unwrap();
+    assert!(export.status.success());
+    let export_stdout = String::from_utf8(export.stdout).unwrap();
+    assert_eq!(export_stdout, "export GV_VERSION=1.23.4\n");
+    assert!(!export_stdout.contains("cd "));
+
+    let unset = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["shell", "--unset"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(unset.stdout).unwrap(),
+        "unset GV_VERSION\n"
+    );
+
+    let both = gv(root.path())
+        .args(["shell", "--unset", "1.2.3"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("不能同时指定版本和 --unset"));
+
+    let latest = gv(root.path()).args(["shell", "latest"]).output().unwrap();
+    assert!(!latest.status.success());
+    assert!(String::from_utf8_lossy(&latest.stderr).contains("无法识别的版本号"));
+}
+
+#[test]
+fn use_unset_deletes_only_the_local_pin() {
+    let root = TempDir::new();
+    let parent = TempDir::new();
+    let child = parent.path().join("child");
+    fs::create_dir_all(&child).unwrap();
+    install_fake_sdk(root.path(), "1.23.4");
+    install_fake_sdk(root.path(), "1.22.5");
+    fs::write(parent.path().join(".go-version"), "1.23.4\n").unwrap();
+    let used = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "1.22.5"])
+        .output()
+        .unwrap();
+    assert!(used.status.success());
+
+    let removed = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "--unset"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(removed.stdout).unwrap(),
+        "已删除当前目录的 .go-version\n"
+    );
+    assert!(!child.join(".go-version").exists());
+    assert_eq!(
+        fs::read_to_string(parent.path().join(".go-version")).unwrap(),
+        "1.23.4\n"
+    );
+
+    let missing = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "--unset"])
+        .output()
+        .unwrap();
+    assert!(missing.status.success());
+    assert_eq!(
+        String::from_utf8(missing.stdout).unwrap(),
+        "当前目录没有 .go-version\n"
+    );
+
+    let global = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "--global", "1.23.4"])
+        .output()
+        .unwrap();
+    assert!(global.status.success());
+    let cleared = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "--global", "--unset"])
+        .output()
+        .unwrap();
+    assert!(cleared.status.success());
+    assert!(!root.path().join("version").exists());
+    assert!(parent.path().join(".go-version").is_file());
+
+    let rejected = gv(root.path())
+        .current_dir(&child)
+        .args(["use", "--unset", "1.2.3"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(parent.path().join(".go-version").is_file());
+    assert!(!child.join(".go-version").exists());
+}
+
+#[test]
+fn list_json_keeps_text_output() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    install_fake_sdk(root.path(), "1.22.1");
+    install_fake_sdk(root.path(), "1.23.4");
+    fs::write(cwd.path().join(".go-version"), "1.23.4\n").unwrap();
+
+    let text = gv(root.path())
+        .current_dir(cwd.path())
+        .arg("list")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(text.stdout).unwrap(),
+        "* 1.23.4\n  1.22.1\n"
+    );
+
+    let json = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["list", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let stdout = String::from_utf8(json.stdout).unwrap();
+    assert!(
+        stdout.contains("\"version\":\"1.23.4\"") || stdout.contains("\"version\": \"1.23.4\"")
+    );
+    assert!(stdout.contains("\"current\":true") || stdout.contains("\"current\": true"));
+    assert!(
+        stdout.contains("\"current\":\"1.23.4\"") || stdout.contains("\"current\": \"1.23.4\"")
+    );
+    assert!(!stdout.contains('*'));
+}
+
+#[test]
+fn list_remote_json_reports_stable_from_cache() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    seed_index(root.path(), &sample_remote_index());
+
+    let text = gv(root.path())
+        .current_dir(cwd.path())
+        .arg("list-remote")
+        .output()
+        .unwrap();
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    assert_eq!(String::from_utf8(text.stdout).unwrap(), "1.24.0\n1.22.5\n");
+
+    let json = gv(root.path())
+        .current_dir(cwd.path())
+        .args(["list-remote", "--all", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let stdout = String::from_utf8(json.stdout).unwrap();
+    assert!(
+        stdout.contains("\"version\":\"1.24.0\"") || stdout.contains("\"version\": \"1.24.0\"")
+    );
+    assert!(stdout.contains("\"stable\":true") || stdout.contains("\"stable\": true"));
+    assert!(stdout.contains("1.25rc1"));
+    assert!(stdout.contains("\"stable\":false") || stdout.contains("\"stable\": false"));
+}
+
+#[test]
+fn install_latest_uses_highest_stable_and_skips_when_present() {
+    let root = TempDir::new();
+    seed_index(root.path(), &sample_remote_index());
+    install_fake_sdk(root.path(), "1.22.5");
+    install_fake_sdk(root.path(), "1.24.0");
+
+    let skipped = gv(root.path())
+        .args(["install", "latest"])
+        .output()
+        .unwrap();
+    assert!(
+        skipped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(skipped.stdout).unwrap(),
+        "Go 1.24.0 已安装\n"
+    );
+    assert!(skipped.stderr.is_empty());
+
+    let _ = fs::remove_dir_all(root.path().join("versions/1.24.0"));
+    let output = gv(root.path())
+        .args(["install", "1.22.5", "latest"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "Go 1.22.5 已安装\n"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("go1.24.0."), "{stderr}");
+    assert!(!stderr.contains("1.25rc1"), "{stderr}");
+    assert!(!stderr.contains("无法识别的版本号"), "{stderr}");
+    assert!(root.path().join("versions/1.22.5/go/bin/go").is_file());
+}
+
+#[test]
+fn clean_removes_archive_cache_only() {
+    let root = TempDir::new();
+    install_fake_sdk(root.path(), "1.23.4");
+    let cache = root.path().join("cache");
+    fs::create_dir_all(cache.join("archives")).unwrap();
+    fs::write(cache.join("index.json"), "{}\n").unwrap();
+    fs::write(
+        cache.join("archives").join("go1.23.4.linux-amd64.tar.gz"),
+        b"tarball",
+    )
+    .unwrap();
+
+    let output = gv(root.path()).arg("clean").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "已删除 1 个安装包缓存\n"
+    );
+    assert!(!cache
+        .join("archives")
+        .join("go1.23.4.linux-amd64.tar.gz")
+        .exists());
+    assert_eq!(fs::read(cache.join("index.json")).unwrap(), b"{}\n");
+    assert!(root.path().join("versions/1.23.4/go/bin/go").is_file());
+
+    let again = gv(root.path()).arg("clean").output().unwrap();
+    assert_eq!(String::from_utf8(again.stdout).unwrap(), "没有安装包缓存\n");
+}

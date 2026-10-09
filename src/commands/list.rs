@@ -1,9 +1,15 @@
 use std::path::Path;
 
-use crate::download;
+use crate::download::{self, RemoteVersion};
 use crate::error::Error;
 use crate::resolve;
 use crate::store;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
 
 pub struct ListReport {
     pub stdout: String,
@@ -14,6 +20,7 @@ pub fn installed_report(
     root: &Path,
     cwd: &Path,
     gv_version: Option<&str>,
+    output: OutputFormat,
 ) -> Result<ListReport, Error> {
     let installed = resolve::installed_versions(root)?;
     let names: Vec<String> = installed.iter().map(ToString::to_string).collect();
@@ -23,10 +30,11 @@ pub fn installed_report(
         Err(err @ Error::NotInstalled(_)) => (None, Some(err.to_string())),
         Err(err) => return Err(err),
     };
-    Ok(ListReport {
-        stdout: format_installed(&names, current.as_deref()),
-        warning,
-    })
+    let stdout = match output {
+        OutputFormat::Text => format_installed(&names, current.as_deref()),
+        OutputFormat::Json => format_installed_json(&names, current.as_deref())?,
+    };
+    Ok(ListReport { stdout, warning })
 }
 
 pub fn format_installed(versions: &[String], current: Option<&str>) -> String {
@@ -46,13 +54,59 @@ pub fn format_installed(versions: &[String], current: Option<&str>) -> String {
     out
 }
 
-pub async fn remote(root: &Path, all: bool, refresh: bool) -> Result<(), Error> {
+pub fn format_installed_json(versions: &[String], current: Option<&str>) -> Result<String, Error> {
+    let installed: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|version| {
+            serde_json::json!({
+                "version": version,
+                "current": Some(version.as_str()) == current,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "current": current,
+        "installed": installed,
+    });
+    json_line(&body)
+}
+
+pub fn format_remote_json(versions: &[RemoteVersion]) -> Result<String, Error> {
+    let rows: Vec<serde_json::Value> = versions
+        .iter()
+        .map(|version| {
+            serde_json::json!({
+                "version": version.version,
+                "stable": version.stable,
+            })
+        })
+        .collect();
+    json_line(&serde_json::json!({ "versions": rows }))
+}
+
+fn json_line(value: &serde_json::Value) -> Result<String, Error> {
+    let mut text = serde_json::to_string(value).map_err(|err| Error::Failed(err.to_string()))?;
+    text.push('\n');
+    Ok(text)
+}
+
+pub async fn remote(
+    root: &Path,
+    all: bool,
+    refresh: bool,
+    output: OutputFormat,
+) -> Result<(), Error> {
     let url = store::index_url();
     let loaded = download::load_index(root, &url, refresh).await?;
-    print!(
-        "{}",
-        download::format_remote(&download::filter_remote(&loaded.releases, all))
-    );
+    let text = match output {
+        OutputFormat::Text => {
+            download::format_remote(&download::filter_remote(&loaded.releases, all))
+        }
+        OutputFormat::Json => {
+            format_remote_json(&download::filter_remote_rows(&loaded.releases, all))?
+        }
+    };
+    print!("{text}");
     Ok(())
 }
 
@@ -69,7 +123,7 @@ mod tests {
         touch_sdk(root.path(), "1.22.1");
         touch_sdk(root.path(), "1.23.4");
         fs::write(cwd.path().join(".go-version"), "1.23.4\n").unwrap();
-        let report = installed_report(root.path(), cwd.path(), None).unwrap();
+        let report = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
         assert!(report.warning.is_none());
         assert_eq!(report.stdout, "* 1.23.4\n  1.22.1\n");
     }
@@ -78,14 +132,60 @@ mod tests {
     fn empty_and_missing_current_do_not_fail_the_list() {
         let root = TempDir::new();
         let cwd = TempDir::new();
-        let empty = installed_report(root.path(), cwd.path(), None).unwrap();
+        let empty = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
         assert_eq!(empty.stdout, "没有已安装的 Go 版本\n");
         assert!(empty.warning.is_none());
 
         touch_sdk(root.path(), "1.22.1");
         fs::write(cwd.path().join(".go-version"), "9.9.9\n").unwrap();
-        let report = installed_report(root.path(), cwd.path(), None).unwrap();
+        let report = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
         assert_eq!(report.stdout, "  1.22.1\n");
         assert!(report.warning.unwrap().contains("gv install 9.9.9"));
+    }
+
+    #[test]
+    fn json_lists_installed_versions_and_the_current_one() {
+        let root = TempDir::new();
+        let cwd = TempDir::new();
+        touch_sdk(root.path(), "1.22.1");
+        touch_sdk(root.path(), "1.23.4");
+        fs::write(cwd.path().join(".go-version"), "1.23.4\n").unwrap();
+        let report = installed_report(root.path(), cwd.path(), None, OutputFormat::Json).unwrap();
+        assert!(report.warning.is_none());
+        let value: serde_json::Value = serde_json::from_str(report.stdout.trim()).unwrap();
+        assert_eq!(value["current"], "1.23.4");
+        assert_eq!(value["installed"][0]["version"], "1.23.4");
+        assert_eq!(value["installed"][0]["current"], true);
+        assert_eq!(value["installed"][1]["version"], "1.22.1");
+        assert_eq!(value["installed"][1]["current"], false);
+
+        let text = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
+        assert_eq!(text.stdout, "* 1.23.4\n  1.22.1\n");
+
+        fs::write(cwd.path().join(".go-version"), "9.9.9\n").unwrap();
+        let missing = installed_report(root.path(), cwd.path(), None, OutputFormat::Json).unwrap();
+        assert!(missing.warning.unwrap().contains("gv install 9.9.9"));
+        let value: serde_json::Value = serde_json::from_str(missing.stdout.trim()).unwrap();
+        assert!(value["current"].is_null());
+        assert_eq!(value["installed"][0]["current"], false);
+    }
+
+    #[test]
+    fn remote_json_includes_the_stable_flag() {
+        let stable = download::RemoteVersion {
+            version: "1.23.4".into(),
+            stable: true,
+        };
+        let preview = download::RemoteVersion {
+            version: "1.24rc1".into(),
+            stable: false,
+        };
+        let text = format_remote_json(&[stable, preview]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["versions"][0]["version"], "1.23.4");
+        assert_eq!(value["versions"][0]["stable"], true);
+        assert_eq!(value["versions"][1]["version"], "1.24rc1");
+        assert_eq!(value["versions"][1]["stable"], false);
+        assert_eq!(download::format_remote(&["1.23.4".into()]), "1.23.4\n");
     }
 }
