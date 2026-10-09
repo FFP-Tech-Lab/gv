@@ -110,7 +110,7 @@ EOF
 }
 
 link_essentials() {
-  for cmd in mktemp tar mkdir mv chmod rm tr awk cp cat sed; do
+  for cmd in mktemp tar mkdir mv chmod rm tr awk cp cat sed gzip; do
     ln -s "$(command -v "$cmd")" "$ess/$cmd"
   done
 }
