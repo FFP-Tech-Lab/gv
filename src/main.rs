@@ -7,6 +7,7 @@ mod platform;
 mod resolve;
 mod shim;
 mod store;
+mod ui;
 
 #[cfg(test)]
 mod testutil;
