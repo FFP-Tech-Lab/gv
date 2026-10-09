@@ -340,4 +340,16 @@ mod tests {
             "Removed 1 cached archive\n"
         );
     }
+
+    #[test]
+    fn error_prefix_follows_animation() {
+        let animated = decide(false, true, Some("xterm"), None);
+        let quiet = decide(true, true, Some("xterm"), None);
+        assert!(animated.animated);
+        assert!(!quiet.animated);
+        assert_eq!(
+            format_result(Tone::Failed, "Go 1.2.3 is not installed. Run gv install 1.2.3", false),
+            "✖ Go 1.2.3 is not installed. Run gv install 1.2.3\n"
+        );
+    }
 }

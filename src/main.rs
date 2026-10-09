@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use crate::error::Error;
+use crate::ui::Tone;
 
 #[derive(Parser)]
 #[command(
@@ -110,21 +111,50 @@ enum Command {
     },
 }
 
+struct RunError {
+    error: Error,
+    quiet: bool,
+}
+
+impl From<Error> for RunError {
+    fn from(error: Error) -> Self {
+        Self { error, quiet: false }
+    }
+}
+
+impl From<std::io::Error> for RunError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from(Error::from(error))
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            for line in err.to_string().lines() {
-                eprintln!("gv: {line}");
-            }
+            report_error(&err);
             ExitCode::from(1)
         }
     }
 }
 
-fn run() -> Result<(), Error> {
+fn report_error(err: &RunError) {
+    let ui = ui::Ui::detect(err.quiet);
+    for line in err.error.to_string().lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if ui.animated() {
+            eprint!("{}", ui::format_result(Tone::Failed, line, ui.color()));
+        } else {
+            eprintln!("gv: {line}");
+        }
+    }
+}
+
+fn run() -> Result<(), RunError> {
     if let Some(tool) = shim::invoked_tool() {
-        return shim::execute(tool);
+        return shim::execute(tool).map_err(RunError::from);
     }
 
     let cli = Cli::parse();
@@ -134,7 +164,8 @@ fn run() -> Result<(), Error> {
 
     match cli.command {
         Command::Install { versions, quiet } => {
-            block_on(commands::install::run(&root, &versions, quiet))?
+            block_on(commands::install::run(&root, &versions, quiet))
+                .map_err(|error| RunError { error, quiet })?;
         }
         Command::Uninstall { versions, force } => {
             commands::uninstall::run(&root, &versions, force)?;
