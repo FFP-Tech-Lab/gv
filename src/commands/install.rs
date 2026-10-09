@@ -27,11 +27,12 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
     let mirror = store::mirror_url();
     let url = store::index_url();
     let client = download::http_client()?;
-    let mut loaded = load_for_install(&client, root, &url, policy_for(&query)).await?;
+    let ui = crate::ui::Ui::detect(quiet);
+    let mut loaded = load_for_install(&client, root, &url, policy_for(&query), &ui).await?;
     let plan = match download::plan_install(&loaded.releases, requested, &platform, &mirror) {
         Ok(plan) => plan,
         Err(err) if should_refresh(&err, &loaded) => {
-            loaded = load_for_install(&client, root, &url, IndexPolicy::Refresh).await?;
+            loaded = load_for_install(&client, root, &url, IndexPolicy::Refresh, &ui).await?;
             download::plan_install(&loaded.releases, requested, &platform, &mirror)?
         }
         Err(err) => return Err(err),
@@ -123,7 +124,8 @@ async fn install_pending(
     } else {
         IndexPolicy::AllowStale
     };
-    let loaded = load_for_install(&client, root, &url, policy).await?;
+    let ui = crate::ui::Ui::detect(quiet);
+    let loaded = load_for_install(&client, root, &url, policy, &ui).await?;
     let mut failures = Vec::new();
     let mut plans = Vec::new();
     let mut seen: Vec<Version> = Vec::new();
@@ -140,7 +142,7 @@ async fn install_pending(
     }
 
     if !refresh_needed.is_empty() {
-        match load_for_install(&client, root, &url, IndexPolicy::Refresh).await {
+        match load_for_install(&client, root, &url, IndexPolicy::Refresh, &ui).await {
             Ok(fresh) => {
                 for spec in refresh_needed {
                     match download::plan_install(&fresh.releases, &spec, &platform, &mirror) {
@@ -192,8 +194,10 @@ async fn load_for_install(
     root: &Path,
     url: &str,
     policy: IndexPolicy,
+    ui: &crate::ui::Ui,
 ) -> Result<LoadedIndex, Error> {
-    let loaded = download::load_index(client, root, url, policy, SystemTime::now()).await?;
+    let loaded =
+        download::load_index_with_ui(client, root, url, policy, SystemTime::now(), ui).await?;
     if let Some(warning) = &loaded.warning {
         eprintln!("gv: {warning}");
     }

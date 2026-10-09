@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::platform::Platform;
 use crate::resolve::{self, Version, VersionQuery};
 use crate::store;
+use crate::ui::Ui;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseFile {
@@ -420,6 +421,17 @@ pub async fn load_index(
     policy: IndexPolicy,
     now: SystemTime,
 ) -> Result<LoadedIndex, Error> {
+    load_index_with_ui(client, root, url, policy, now, &Ui::plain()).await
+}
+
+pub async fn load_index_with_ui(
+    client: &reqwest::Client,
+    root: &Path,
+    url: &str,
+    policy: IndexPolicy,
+    now: SystemTime,
+    ui: &Ui,
+) -> Result<LoadedIndex, Error> {
     let cached = read_index_cache(root, url, now)?;
     match policy {
         IndexPolicy::Offline => {
@@ -443,7 +455,7 @@ pub async fn load_index(
                 if cache.fresh {
                     return Ok(cached_index(cache, None, false));
                 }
-                match fetch_index(client, root, url).await {
+                match fetch_index(client, root, url, ui).await {
                     Ok(releases) => {
                         return Ok(LoadedIndex {
                             releases,
@@ -466,7 +478,7 @@ pub async fn load_index(
         }
         IndexPolicy::Refresh => {}
     }
-    let releases = fetch_index(client, root, url).await?;
+    let releases = fetch_index(client, root, url, ui).await?;
     Ok(LoadedIndex {
         releases,
         from_cache: false,
@@ -479,7 +491,9 @@ async fn fetch_index(
     client: &reqwest::Client,
     root: &Path,
     url: &str,
+    ui: &Ui,
 ) -> Result<Vec<Release>, Error> {
+    let _activity = ui.start("Fetching the Go version index");
     let bytes = http_get(client, url).await?;
     let body =
         String::from_utf8(bytes).map_err(|_| Error::IndexParse("index is not UTF-8".into()))?;

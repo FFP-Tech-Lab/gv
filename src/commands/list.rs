@@ -115,7 +115,9 @@ pub async fn remote(
     };
     let url = store::index_url();
     let client = download::http_client()?;
-    let loaded = download::load_index(&client, root, &url, policy, SystemTime::now()).await?;
+    let ui = crate::ui::Ui::detect(false);
+    let loaded =
+        download::load_index_with_ui(&client, root, &url, policy, SystemTime::now(), &ui).await?;
     if let Some(warning) = &loaded.warning {
         eprintln!("gv: {warning}");
     }
