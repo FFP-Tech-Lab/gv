@@ -7,15 +7,17 @@ use crate::store;
 
 pub fn run(root: &Path, requested: &[String], force: bool) -> Result<(), Error> {
     if requested.len() == 1 {
-        println!("{}", uninstall_one(root, &requested[0], force)?);
+        uninstall_one(root, &requested[0], force)?;
         return Ok(());
     }
 
     let mut failures = Vec::new();
     for spec in requested {
         match uninstall_one(root, spec, force) {
-            Ok(message) => println!("{message}"),
-            Err(Error::NotInstalled(name)) => println!("Go {name} is not installed"),
+            Ok(_) => {}
+            Err(Error::NotInstalled(name)) => {
+                show_uninstall(&format!("Go {name} is not installed"));
+            }
             Err(err) => failures.push(format!("Failed to uninstall Go {spec}: {err}")),
         }
     }
@@ -41,14 +43,30 @@ fn uninstall_one(root: &Path, requested: &str, force: bool) -> Result<String, Er
     if meta.file_type().is_symlink() {
         return Err(Error::UnsafePath(dir.display().to_string()));
     }
+    let ui = crate::ui::Ui::detect(false);
+    let activity = ui.start(&format!("Uninstalling Go {name}"));
     fs::remove_dir_all(&dir)?;
     if points {
         fs::remove_file(store::global_version_path(root))?;
-        return Ok(format!(
-            "Uninstalled Go {name} and cleared the global version"
-        ));
+        let message = format!("Uninstalled Go {name} and cleared the global version");
+        activity.finish(crate::ui::Tone::Done, &message);
+        return Ok(message);
     }
-    Ok(format!("Uninstalled Go {name}"))
+    let message = format!("Uninstalled Go {name}");
+    activity.finish(crate::ui::Tone::Done, &message);
+    Ok(message)
+}
+
+fn uninstall_tone(message: &str) -> crate::ui::Tone {
+    if message.starts_with("Uninstalled Go ") {
+        crate::ui::Tone::Done
+    } else {
+        crate::ui::Tone::Notice
+    }
+}
+
+fn show_uninstall(message: &str) {
+    crate::ui::Ui::detect(false).finish(uninstall_tone(message), message);
 }
 
 fn global_points_at(root: &Path, version: &Version) -> Result<bool, Error> {
@@ -71,6 +89,22 @@ mod tests {
     use super::*;
     use crate::testutil::{touch_sdk, TempDir};
     use std::fs;
+
+    #[test]
+    fn uninstall_tones_match_the_sentences() {
+        assert_eq!(
+            uninstall_tone("Uninstalled Go 1.22.0"),
+            crate::ui::Tone::Done
+        );
+        assert_eq!(
+            uninstall_tone("Uninstalled Go 1.23.4 and cleared the global version"),
+            crate::ui::Tone::Done
+        );
+        assert_eq!(
+            uninstall_tone("Go 9.9.9 is not installed"),
+            crate::ui::Tone::Notice
+        );
+    }
 
     #[test]
     fn refuses_when_global_points_at_version_unless_forced() {
