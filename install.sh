@@ -30,7 +30,7 @@ case "$os:$mach" in
     ;;
 esac
 
-version=${GV_VERSION-}
+version=${GV_RELEASE-}
 if [ -n "$version" ]; then
   version=${version#v}
   base="${repo}/releases/download/v${version}"

@@ -46,10 +46,10 @@
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | sh
 ```
 
-二进制安装到 `~/.gv/bin/gv`。`GV_VERSION` 用来选择已发布的 tag。带前导 `v` 和不带前导 `v` 的值指向同一个 tag。`GV_VERSION=0.1.0` 安装的是 `v0.1.0`。
+二进制安装到 `~/.gv/bin/gv`。`GV_RELEASE` 用来选择已发布的 tag。带前导 `v` 和不带前导 `v` 的值指向同一个 tag。`GV_RELEASE=0.1.0` 安装的是 `v0.1.0`。
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_VERSION=0.1.0 sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_RELEASE=0.1.0 sh
 ```
 
 第一次运行任意 `gv` 子命令时，会准备下面的目录。`shims/go` 和 `shims/gofmt` 是指向 `gv` 的符号链接。程序名是 `go` 或 `gofmt` 时，`gv` 会解析版本，然后执行 `$GV_ROOT/versions/<version>/go/bin/` 下的真实二进制。执行前会去掉已有的 `GOROOT`；只有在 `GOTOOLCHAIN` 未设置时，才把它设为 `local`。

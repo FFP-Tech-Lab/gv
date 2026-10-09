@@ -41,13 +41,13 @@ en_dev=$(section "$root/README.md" "## Development" "___END___")
 zh_dev=$(section "$root/README.zh-CN.md" "## 开发" "___END___")
 
 curl_line='curl --proto '"'"'=https'"'"' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | sh'
-version_line='curl --proto '"'"'=https'"'"' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_VERSION=0.1.0 sh'
+version_line='curl --proto '"'"'=https'"'"' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_RELEASE=0.1.0 sh'
 
 for text in "$en_install" "$zh_install"; do
   assert_has "$text" "$curl_line"
   assert_has "$text" "$version_line"
   assert_has "$text" "~/.gv/bin/gv"
-  assert_has "$text" "GV_VERSION"
+  assert_has "$text" "GV_RELEASE"
   assert_lacks "$text" "cargo install --path ."
   assert_lacks "$text" "cargo build --release"
 done

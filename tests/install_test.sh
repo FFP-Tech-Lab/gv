@@ -140,6 +140,8 @@ begin_case() {
   root_value=
   pass_version=0
   version_value=
+  pass_gv_version=0
+  gv_version_value=
 }
 
 apply_tool_flags() {
@@ -171,7 +173,10 @@ invoke() {
     set -- "$@" "GV_ROOT=$root_value"
   fi
   if [ "$pass_version" -eq 1 ]; then
-    set -- "$@" "GV_VERSION=$version_value"
+    set -- "$@" "GV_RELEASE=$version_value"
+  fi
+  if [ "$pass_gv_version" -eq 1 ]; then
+    set -- "$@" "GV_VERSION=$gv_version_value"
   fi
   set -- "$@" /bin/sh "$script"
   set +e
@@ -316,6 +321,15 @@ success_case Darwin amd64 gv-darwin-amd64.tar.gz latest
 success_case Darwin aarch64 gv-darwin-arm64.tar.gz v
 success_case Darwin arm64 gv-darwin-arm64.tar.gz bare
 success_case Linux x86_64 gv-linux-amd64.tar.gz empty
+
+begin_case
+pass_gv_version=1
+gv_version_value=1.23.4
+write_archive gv-linux-amd64.tar.gz "sdk-version-ignored" gv
+write_sums gv-linux-amd64.tar.gz "$(hash_of "$fixture/gv-linux-amd64.tar.gz")" "  "
+invoke
+expect_success gv-linux-amd64.tar.gz "https://github.com/FFP-Tech-Lab/gv/releases/latest/download"
+rm -rf "$tmp"
 
 begin_case
 pass_home=0
