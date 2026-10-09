@@ -43,13 +43,13 @@
 ## Install
 
 ```bash
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | sh
 ```
 
-Or build it locally:
+The binary is installed at `~/.gv/bin/gv`. `GV_VERSION` selects a published tag. A value with a leading `v` and a value without one select the same tag. `GV_VERSION=0.1.0` installs `v0.1.0`.
 
 ```bash
-cargo build --release
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/FFP-Tech-Lab/gv/main/install.sh | GV_VERSION=0.1.0 sh
 ```
 
 The first `gv` subcommand prepares this layout. `shims/go` and `shims/gofmt` are symlinks to `gv`. When the program name is `go` or `gofmt`, `gv` resolves the version and execs `$GV_ROOT/versions/<version>/go/bin/`. It removes any existing `GOROOT` before exec, and sets `GOTOOLCHAIN=local` only when `GOTOOLCHAIN` is unset.
@@ -174,6 +174,7 @@ Paths containing `..`, absolute paths, or unsafe link targets are refused. Only 
 
 ```bash
 cargo test
+cargo build --release
 ```
 
 Tests do not access the network. `rust-toolchain.toml` pins Rust 1.99, which the current dependencies require. The program itself uses Rust edition 2021.

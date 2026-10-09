@@ -38,6 +38,9 @@ jobs:
       - name: Test installer
         run: sh tests/install_test.sh
 
+      - name: Test docs
+        run: sh tests/docs_test.sh
+
       - name: Test workflows
         run: sh tests/workflows_test.sh
 

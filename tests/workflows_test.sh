@@ -38,6 +38,7 @@ require_in "$ci" "rustup toolchain install"
 require_in "$ci" '"$channel" --profile minimal --no-self-update'
 require_in "$ci" "cargo test --locked"
 require_in "$ci" "sh tests/install_test.sh"
+require_in "$ci" "sh tests/docs_test.sh"
 require_in "$ci" "sh tests/workflows_test.sh"
 require_in "$ci" "sh -n install.sh"
 require_in "$ci" "runner.os == 'Linux'"
