@@ -530,6 +530,21 @@ pub fn extract_status(version: &str) -> String {
     format!("Extracting Go {version}\n")
 }
 
+fn install_result(status: InstallStatus, version: &str) -> (crate::ui::Tone, String) {
+    match status {
+        InstallStatus::Installed => (crate::ui::Tone::Done, format!("Installed Go {version}")),
+        InstallStatus::AlreadyPresent => (
+            crate::ui::Tone::Notice,
+            format!("Go {version} is already installed"),
+        ),
+    }
+}
+
+fn finish_bar(bar: ProgressBar, tone: crate::ui::Tone, message: &str, color: bool) {
+    bar.set_style(ProgressStyle::with_template("{msg}").expect("result template"));
+    bar.finish_with_message(crate::ui::format_result_line(tone, message, color));
+}
+
 fn write_status(ui: TransferUi, line: &str) {
     if !ui.status {
         return;
@@ -609,20 +624,31 @@ pub async fn install_plans(
     client: &reqwest::Client,
     plans: Vec<InstallPlan>,
     ui: TransferUi,
+    present: crate::ui::Ui,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     if plans.len() <= 1 {
-        return install_plans_sequential(client, plans, ui, versions_dir, cache_dir).await;
+        return install_plans_sequential(client, plans, ui, present, versions_dir, cache_dir).await;
     }
     let render = progress_render(plans.len(), ui, ProgressDrawTarget::stderr().is_hidden());
     match render {
         ProgressRender::Multi => {
             let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            install_plans_concurrent(client, plans, Some(multi), ui, versions_dir, cache_dir).await
+            install_plans_concurrent(
+                client,
+                plans,
+                Some(multi),
+                ui,
+                present,
+                versions_dir,
+                cache_dir,
+            )
+            .await
         }
         ProgressRender::Plain | ProgressRender::SingleBar => {
-            install_plans_concurrent(client, plans, None, ui, versions_dir, cache_dir).await
+            install_plans_concurrent(client, plans, None, ui, present, versions_dir, cache_dir)
+                .await
         }
     }
 }
@@ -631,13 +657,15 @@ async fn install_plans_sequential(
     client: &reqwest::Client,
     plans: Vec<InstallPlan>,
     ui: TransferUi,
+    present: crate::ui::Ui,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
     let mut results = Vec::with_capacity(plans.len());
     for plan in plans {
         let version = plan.version.to_string();
-        match download_and_install(client, plan, ui, None, versions_dir, cache_dir).await {
+        match download_and_install(client, plan, ui, present, None, versions_dir, cache_dir).await
+        {
             Ok(status) => results.push(Ok((version, status))),
             Err(err) => results.push(Err((version, err))),
         }
@@ -650,6 +678,7 @@ async fn install_plans_concurrent(
     plans: Vec<InstallPlan>,
     multi: Option<MultiProgress>,
     ui: TransferUi,
+    present: crate::ui::Ui,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
@@ -676,6 +705,7 @@ async fn install_plans_concurrent(
         let version = plan.version.to_string();
         let client = client.clone();
         let semaphore = semaphore.clone();
+        let present = present;
         let handle = tokio::spawn(async move {
             let Ok(_permit) = semaphore.acquire_owned().await else {
                 return Err(Error::Failed("download was cancelled".into()));
@@ -688,8 +718,16 @@ async fn install_plans_concurrent(
                     status: ui.status,
                 }
             };
-            download_and_install(&client, plan, task_ui, bar.as_ref(), &versions_dir, &cache_dir)
-                .await
+            download_and_install(
+                &client,
+                plan,
+                task_ui,
+                present,
+                bar.as_ref(),
+                &versions_dir,
+                &cache_dir,
+            )
+            .await
         });
         jobs.push((index, version, handle));
     }
@@ -715,14 +753,48 @@ async fn download_and_install(
     client: &reqwest::Client,
     plan: InstallPlan,
     ui: TransferUi,
+    present: crate::ui::Ui,
     shared_bar: Option<&ProgressBar>,
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Result<InstallStatus, Error> {
     let version = plan.version.to_string();
-    let path = fetch_cached_archive(client, &plan, cache_dir, ui, shared_bar).await?;
-    write_status(ui, &extract_status(&version));
-    install_archive_file_async(path, versions_dir.to_path_buf(), version).await
+    let fetched = fetch_cached_archive(client, &plan, cache_dir, ui, present, shared_bar).await?;
+    let extract = format!("Extracting Go {version}");
+    if present.animated() {
+        if let Some(bar) = &fetched.bar {
+            bar.set_style(spinner_style());
+            bar.set_message(extract.clone());
+        } else if let Some(activity) = &fetched.activity {
+            activity.set_message(&extract);
+        }
+    } else {
+        write_status(ui, &extract_status(&version));
+    }
+    let status = match install_archive_file_async(
+        fetched.path,
+        versions_dir.to_path_buf(),
+        version.clone(),
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            if let Some(bar) = fetched.bar {
+                bar.finish_and_clear();
+            }
+            return Err(err);
+        }
+    };
+    if present.animated() {
+        let (tone, message) = install_result(status, &version);
+        if let Some(bar) = fetched.bar {
+            finish_bar(bar, tone, &message, present.color());
+        } else if let Some(activity) = fetched.activity {
+            activity.finish(tone, &message);
+        }
+    }
+    Ok(status)
 }
 
 fn archive_dest(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
@@ -739,40 +811,98 @@ fn partial_archive_path(cache_dir: &Path, filename: &str) -> Result<PathBuf, Err
     Ok(cache_dir.join(format!(".partial-{filename}")))
 }
 
+struct Fetched {
+    path: PathBuf,
+    bar: Option<ProgressBar>,
+    activity: Option<crate::ui::Activity>,
+    #[allow(dead_code)]
+    cache_hit: bool,
+}
+
 /// Reuse a cached file when it exists and the checksum matches. Delete the file if the check fails; a newly downloaded file is deleted the same way if its check fails.
 async fn fetch_cached_archive(
     client: &reqwest::Client,
     plan: &InstallPlan,
     cache_dir: &Path,
     ui: TransferUi,
+    present: crate::ui::Ui,
     shared_bar: Option<&ProgressBar>,
-) -> Result<PathBuf, Error> {
+) -> Result<Fetched, Error> {
     let dest = archive_dest(cache_dir, &plan.filename)?;
     if dest.is_file() {
+        let activity = if present.animated() && shared_bar.is_none() {
+            Some(present.start(&format!("Using cached archive {}", plan.filename)))
+        } else {
+            None
+        };
+        if present.animated() {
+            if let Some(bar) = shared_bar {
+                bar.set_style(spinner_style());
+                bar.set_message(format!("Using cached archive {}", plan.filename));
+            }
+        }
         match verify_file_sha256_async(dest.clone(), plan.sha256.clone()).await {
             Ok(()) => {
-                write_status(ui, &cached_archive_status(&plan.filename));
-                return Ok(dest);
+                if !present.animated() {
+                    write_status(ui, &cached_archive_status(&plan.filename));
+                }
+                return Ok(Fetched {
+                    path: dest,
+                    bar: if present.animated() {
+                        shared_bar.cloned()
+                    } else {
+                        None
+                    },
+                    activity,
+                    cache_hit: true,
+                });
             }
             Err(Error::Checksum { .. }) => {
+                drop(activity);
                 let _ = fs::remove_file(&dest);
             }
             Err(err) => return Err(err),
         }
     }
     let partial = partial_archive_path(cache_dir, &plan.filename)?;
-    if let Err(err) = download_with_retry(client, plan, &dest, &partial, ui, shared_bar).await {
-        if let Some(bar) = shared_bar {
-            bar.finish_and_clear();
+    match download_with_retry(
+        client,
+        plan,
+        &dest,
+        &partial,
+        ui,
+        shared_bar,
+        ui.bar && present.animated(),
+    )
+    .await
+    {
+        Ok(attempt) => Ok(Fetched {
+            path: dest,
+            bar: if present.animated() {
+                attempt.bar.or_else(|| shared_bar.cloned())
+            } else {
+                None
+            },
+            activity: None,
+            cache_hit: false,
+        }),
+        Err(err) => {
+            if let Some(bar) = shared_bar {
+                bar.finish_and_clear();
+            }
+            let _ = fs::remove_file(&dest);
+            Err(err)
         }
-        let _ = fs::remove_file(&dest);
-        return Err(err);
     }
-    Ok(dest)
+}
+
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {msg}").expect("spinner template")
 }
 
 struct DownloadAttempt {
     streamed_sha256: Option<String>,
+    bar: Option<ProgressBar>,
 }
 
 async fn download_with_retry(
@@ -782,26 +912,30 @@ async fn download_with_retry(
     partial: &Path,
     ui: TransferUi,
     shared_bar: Option<&ProgressBar>,
-) -> Result<(), Error> {
+    keep_bar: bool,
+) -> Result<DownloadAttempt, Error> {
     let mut last_error = None;
     for attempt in 0..DOWNLOAD_ATTEMPTS {
         if attempt > 0 {
             let shift = attempt - 1;
             tokio::time::sleep(Duration::from_millis(200 * (1_u64 << shift))).await;
         }
-        match download_attempt(client, plan, dest, partial, ui, shared_bar).await {
+        match download_attempt(client, plan, dest, partial, ui, shared_bar, keep_bar).await {
             Ok(attempt_result) => {
-                let check = if let Some(actual) = attempt_result.streamed_sha256 {
+                let check = if let Some(actual) = attempt_result.streamed_sha256.clone() {
                     compare_sha256(actual, &plan.sha256)
                 } else {
                     verify_file_sha256_async(dest.to_path_buf(), plan.sha256.clone()).await
                 };
                 if let Err(err) = check {
+                    if let Some(bar) = &attempt_result.bar {
+                        bar.finish_and_clear();
+                    }
                     let _ = fs::remove_file(dest);
                     let _ = fs::remove_file(partial);
                     return Err(err);
                 }
-                return Ok(());
+                return Ok(attempt_result);
             }
             Err(err) if is_retriable(&err) && attempt + 1 < DOWNLOAD_ATTEMPTS => {
                 last_error = Some(err);
@@ -824,6 +958,7 @@ async fn download_attempt(
     partial: &Path,
     ui: TransferUi,
     shared_bar: Option<&ProgressBar>,
+    keep_bar: bool,
 ) -> Result<DownloadAttempt, Error> {
     let existing = if partial.is_file() {
         fs::metadata(partial)?.len()
@@ -894,9 +1029,10 @@ async fn download_attempt(
     file.sync_all()?;
     drop(file);
     fs::rename(partial, dest)?;
-    progress.finish_ok();
+    let bar = progress.detach_bar(keep_bar);
     Ok(DownloadAttempt {
         streamed_sha256: hasher.map(|hasher| hex_encode(&hasher.finalize())),
+        bar,
     })
 }
 
@@ -1066,6 +1202,7 @@ impl TransferProgress {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn finish_ok(&mut self) {
         self.finished = true;
         if let Some(bar) = &self.bar {
@@ -1081,6 +1218,30 @@ impl TransferProgress {
         );
         let mut stderr = io::stderr().lock();
         let _ = stderr.write_all(line.as_bytes());
+    }
+
+    fn detach_bar(&mut self, keep: bool) -> Option<ProgressBar> {
+        self.finished = true;
+        if keep {
+            if let Some(bar) = &self.bar {
+                bar.set_position(self.downloaded);
+            }
+            return self.bar.take();
+        }
+        if let Some(bar) = &self.bar {
+            bar.set_position(self.downloaded);
+            bar.finish();
+            return None;
+        }
+        let line = format_transferred(
+            &self.label,
+            self.downloaded,
+            self.total,
+            self.started.elapsed(),
+        );
+        let mut stderr = io::stderr().lock();
+        let _ = stderr.write_all(line.as_bytes());
+        None
     }
 }
 
@@ -1346,6 +1507,24 @@ mod tests {
     }
 
     #[test]
+    fn install_result_marks_new_and_existing_versions() {
+        assert_eq!(
+            install_result(InstallStatus::Installed, "1.23.4"),
+            (
+                crate::ui::Tone::Done,
+                "Installed Go 1.23.4".to_string()
+            )
+        );
+        assert_eq!(
+            install_result(InstallStatus::AlreadyPresent, "1.23.4"),
+            (
+                crate::ui::Tone::Notice,
+                "Go 1.23.4 is already installed".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn quiet_or_non_tty_uses_one_transferred_line() {
         assert_eq!(
             transfer_ui(true, true, Some("xterm")),
@@ -1505,6 +1684,7 @@ mod tests {
                 plans,
                 Some(multi),
                 bar_ui(),
+                crate::ui::Ui::plain(),
                 &versions,
                 &cache,
             ),
@@ -1555,7 +1735,14 @@ mod tests {
         let cache = root.path().join("archives");
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans(&http_client().unwrap(), plans, quiet_ui(), &versions, &cache),
+            install_plans(
+                &http_client().unwrap(),
+                plans,
+                quiet_ui(),
+                crate::ui::Ui::plain(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("concurrent install timed out");
@@ -1599,6 +1786,7 @@ mod tests {
                 &http_client().unwrap(),
                 vec![plan],
                 quiet_ui(),
+                crate::ui::Ui::plain(),
                 &versions,
                 &cache,
             ),
@@ -1637,6 +1825,7 @@ mod tests {
                 &http_client().unwrap(),
                 vec![plan.clone()],
                 quiet_ui(),
+                crate::ui::Ui::plain(),
                 &versions,
                 &cache,
             ),
@@ -2055,7 +2244,14 @@ mod tests {
         let client = http_client().unwrap();
         let results = tokio::time::timeout(
             Duration::from_secs(8),
-            install_plans(&client, vec![plan], quiet_ui(), &versions, &cache),
+            install_plans(
+                &client,
+                vec![plan],
+                quiet_ui(),
+                crate::ui::Ui::plain(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("resume timed out");
@@ -2099,7 +2295,14 @@ mod tests {
         );
         let failed = tokio::time::timeout(
             Duration::from_secs(5),
-            install_plans(&client, vec![missing], quiet_ui(), &versions, &cache),
+            install_plans(
+                &client,
+                vec![missing],
+                quiet_ui(),
+                crate::ui::Ui::plain(),
+                &versions,
+                &cache,
+            ),
         )
         .await
         .expect("404 timed out");
