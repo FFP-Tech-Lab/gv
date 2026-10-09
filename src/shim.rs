@@ -26,7 +26,7 @@ impl Tool {
     }
 }
 
-/// 去掉已有 `GOROOT`，让 Go 按二进制位置推断。仅在 `GOTOOLCHAIN` 未设置时设为 `local`。
+/// Drop any existing `GOROOT` so Go infers it from the binary location. Set `GOTOOLCHAIN` to `local` only when it is unset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShimEnv {
     pub remove_goroot: bool,

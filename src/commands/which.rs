@@ -37,7 +37,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "1.23.4（.go-version: {}）\n{}\n{}\n",
+                "1.23.4 (.go-version: {})\n{}\n{}\n",
                 pin.display(),
                 go.display(),
                 gofmt.display()
@@ -51,6 +51,9 @@ mod tests {
         let project = TempDir::new();
         fs::write(project.path().join(".go-version"), "1.2.3\n").unwrap();
         let err = which(root.path(), project.path(), None).unwrap_err();
-        assert_eq!(err.to_string(), "未安装 Go 1.2.3。请运行 gv install 1.2.3");
+        assert_eq!(
+            err.to_string(),
+            "Go 1.2.3 is not installed. Run gv install 1.2.3"
+        );
     }
 }

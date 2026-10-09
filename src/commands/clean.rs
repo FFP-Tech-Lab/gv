@@ -7,7 +7,7 @@ use crate::store;
 pub fn run(root: &Path) -> Result<String, Error> {
     let dir = store::archive_cache_dir(root);
     if !dir.is_dir() {
-        return Ok("没有安装包缓存\n".to_string());
+        return Ok("No cached archives\n".to_string());
     }
     let mut removed = 0u64;
     for entry in fs::read_dir(&dir)? {
@@ -22,9 +22,11 @@ pub fn run(root: &Path) -> Result<String, Error> {
         removed += 1;
     }
     if removed == 0 {
-        Ok("没有安装包缓存\n".to_string())
+        Ok("No cached archives\n".to_string())
+    } else if removed == 1 {
+        Ok("Removed 1 cached archive\n".to_string())
     } else {
-        Ok(format!("已删除 {removed} 个安装包缓存\n"))
+        Ok(format!("Removed {removed} cached archives\n"))
     }
 }
 
@@ -48,20 +50,20 @@ mod tests {
         fs::write(archives.join(".partial-go1.23.4.tar.gz-1-1"), b"partial").unwrap();
 
         let text = run(root.path()).unwrap();
-        assert_eq!(text, "已删除 2 个安装包缓存\n");
+        assert_eq!(text, "Removed 2 cached archives\n");
         assert!(!archives.join("go1.23.4.linux-amd64.tar.gz").exists());
         assert!(!archives.join(".partial-go1.23.4.tar.gz-1-1").exists());
         assert_eq!(fs::read(cache.join("index.json")).unwrap(), b"{}\n");
         assert!(store::tool_path(root.path(), "1.23.4", "go").is_file());
 
-        assert_eq!(run(root.path()).unwrap(), "没有安装包缓存\n");
+        assert_eq!(run(root.path()).unwrap(), "No cached archives\n");
     }
 
     #[test]
     fn missing_cache_is_success() {
         let root = TempDir::new();
         touch_sdk(root.path(), "1.2.3");
-        assert_eq!(run(root.path()).unwrap(), "没有安装包缓存\n");
+        assert_eq!(run(root.path()).unwrap(), "No cached archives\n");
         assert!(store::tool_path(root.path(), "1.2.3", "go").is_file());
     }
 }

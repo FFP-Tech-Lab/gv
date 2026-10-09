@@ -210,7 +210,7 @@ pub fn filter_remote(releases: &[Release], all: bool) -> Vec<String> {
 
 pub fn format_remote(versions: &[String]) -> String {
     if versions.is_empty() {
-        return "没有匹配的远端版本\n".to_string();
+        return "No matching remote versions\n".to_string();
     }
     let mut text = versions.join("\n");
     text.push('\n');
@@ -332,7 +332,8 @@ pub async fn load_index(root: &Path, url: &str, refresh: bool) -> Result<LoadedI
         });
     }
     let bytes = http_get(url).await?;
-    let body = String::from_utf8(bytes).map_err(|_| Error::IndexParse("索引不是 UTF-8".into()))?;
+    let body =
+        String::from_utf8(bytes).map_err(|_| Error::IndexParse("index is not UTF-8".into()))?;
     let releases = parse_index(&body)?;
     write_cached_index(root, url, &body)?;
     Ok(LoadedIndex {
@@ -374,9 +375,9 @@ fn format_transferred(
     let secs = elapsed.as_secs_f64();
     if downloaded > 0 && secs > 0.0 {
         let per_sec = (downloaded as f64 / secs).round() as u64;
-        format!("已传输 {label} {amount} 字节（{per_sec} 字节/秒）\n")
+        format!("Transferred {label} {amount} bytes ({per_sec} bytes/sec)\n")
     } else {
-        format!("已传输 {label} {amount} 字节\n")
+        format!("Transferred {label} {amount} bytes\n")
     }
 }
 
@@ -415,8 +416,8 @@ fn progress_render(count: usize, ui: DownloadUi, stderr_hidden: bool) -> Progres
     }
 }
 
-/// 下载并安装多个计划。多于一个且终端可绘制时，每个版本一条进度条；否则各自打印一行已传输字节数。
-/// 某个版本失败不会取消其余版本。压缩包先落到 `cache_dir`，校验通过后再解压。
+/// Download and install several plans. When there is more than one and the terminal can draw, each version gets its own progress bar; otherwise each prints one line of transferred bytes.
+/// A failure for one version does not cancel the others. Archives land in `cache_dir` first and are extracted only after the checksum passes.
 pub async fn install_plans(
     plans: Vec<InstallPlan>,
     ui: DownloadUi,
@@ -461,8 +462,8 @@ async fn install_plans_concurrent(
     versions_dir: &Path,
     cache_dir: &Path,
 ) -> Vec<Result<(String, InstallStatus), (String, Error)>> {
-    // 父任务持有每条进度条到全部下载结束。先完成的条如果被丢掉，
-    // 其他条刷新时会把它从屏幕上清掉。
+    // The parent task holds every progress bar until all downloads finish. Dropping a
+    // finished bar lets a refresh of the others clear it from the screen.
     let bars: Vec<Option<ProgressBar>> = match &multi {
         Some(multi) => plans
             .iter()
@@ -496,7 +497,10 @@ async fn install_plans_concurrent(
         let result = match handle.await {
             Ok(Ok(status)) => Ok((version, status)),
             Ok(Err(err)) => Err((version, err)),
-            Err(err) => Err((version, Error::Failed(format!("安装任务中断：{err}")))),
+            Err(err) => Err((
+                version,
+                Error::Failed(format!("install task interrupted: {err}")),
+            )),
         };
         finished.push((index, result));
     }
@@ -539,7 +543,7 @@ fn archive_dest(cache_dir: &Path, filename: &str) -> Result<PathBuf, Error> {
     Ok(cache_dir.join(filename))
 }
 
-/// 缓存文件存在且校验通过就复用。校验失败则删除该文件；新下载校验失败同样删除。
+/// Reuse a cached file when it exists and the checksum matches. Delete the file if the check fails; a newly downloaded file is deleted the same way if its check fails.
 async fn fetch_cached_archive(
     plan: &InstallPlan,
     cache_dir: &Path,
@@ -600,7 +604,7 @@ async fn download_archive_bar_to(
     if let Some(len) = total {
         bar.set_length(len);
         bar.set_style(progress_style(Some(len)));
-        bar.set_message(format!("下载 {label}"));
+        bar.set_message(format!("Downloading {label}"));
     }
     let mut progress = TransferProgress::from_bar(label, total, bar.clone());
     write_response_to(url, response, dest, label, &mut progress).await?;
@@ -805,13 +809,13 @@ fn progress_style(total: Option<u64>) -> ProgressStyle {
         "{msg} {bytes} {bytes_per_sec}"
     };
     ProgressStyle::with_template(template)
-        .expect("进度条模板")
+        .expect("progress bar template")
         .progress_chars("=>-")
 }
 
 fn style_bar(bar: &ProgressBar, label: &str, total: Option<u64>) {
     bar.set_style(progress_style(total));
-    bar.set_message(format!("下载 {label}"));
+    bar.set_message(format!("Downloading {label}"));
     bar.enable_steady_tick(Duration::from_millis(120));
 }
 
@@ -821,7 +825,7 @@ fn make_bar(label: &str, total: Option<u64>) -> ProgressBar {
     bar
 }
 
-/// 先校验 SHA256，再在临时目录解压。路径里出现 `..` 或绝对路径时拒绝写入。
+/// Verify the SHA256, then extract into a temporary directory. Refuse a path that contains `..` or is absolute.
 #[cfg(test)]
 pub fn install_verified_archive(
     bytes: &[u8],
@@ -833,7 +837,7 @@ pub fn install_verified_archive(
     install_tree(versions_dir, version, |tmp| extract_tarball(bytes, tmp))
 }
 
-/// 从已经校验过的缓存文件解压。调用方负责 SHA256；校验失败时不要调用本函数。
+/// Extract from a cache file that has already been verified. The caller owns the SHA256 check; do not call this if verification failed.
 pub fn install_archive_file(
     path: &Path,
     versions_dir: &Path,
@@ -870,7 +874,7 @@ fn install_tree(
     let cleanup = RemoveAll(&tmp);
     extract(&tmp)?;
     if !tmp.join("go").join("bin").join("go").is_file() {
-        return Err(Error::BadArchive("压缩包缺少 go/bin/go".into()));
+        return Err(Error::BadArchive("archive is missing go/bin/go".into()));
     }
     fs::rename(&tmp, &final_dir)?;
     drop(cleanup);
@@ -946,7 +950,7 @@ fn validate_tarball_reader(reader: impl BufRead) -> Result<(), Error> {
         }
         if !entry_type_allowed(entry.header().entry_type()) {
             return Err(Error::UnsafePath(format!(
-                "不支持的条目类型：{}",
+                "unsupported entry type: {}",
                 path.display()
             )));
         }
@@ -956,7 +960,7 @@ fn validate_tarball_reader(reader: impl BufRead) -> Result<(), Error> {
 
 fn check_rel_path(path: &Path) -> Result<(), Error> {
     if path.as_os_str().is_empty() {
-        return Err(Error::UnsafePath("空路径".into()));
+        return Err(Error::UnsafePath("empty path".into()));
     }
     if path.is_absolute() {
         return Err(Error::UnsafePath(path.display().to_string()));
@@ -1072,15 +1076,15 @@ mod tests {
         );
         assert_eq!(
             format_transferred("go.tar.gz", 100, Some(200), Duration::from_secs(2)),
-            "已传输 go.tar.gz 100/200 字节（50 字节/秒）\n"
+            "Transferred go.tar.gz 100/200 bytes (50 bytes/sec)\n"
         );
         assert_eq!(
             format_transferred("go.tar.gz", 100, None, Duration::ZERO),
-            "已传输 go.tar.gz 100 字节\n"
+            "Transferred go.tar.gz 100 bytes\n"
         );
         assert_eq!(
             format_transferred("go.tar.gz", 0, Some(0), Duration::from_secs(1)),
-            "已传输 go.tar.gz 0/0 字节\n"
+            "Transferred go.tar.gz 0/0 bytes\n"
         );
     }
 
@@ -1514,7 +1518,7 @@ mod tests {
         );
         let all = filter_remote(&releases, true);
         assert!(all.contains(&"1.23rc1".to_string()));
-        assert_eq!(format_remote(&[]), "没有匹配的远端版本\n");
+        assert_eq!(format_remote(&[]), "No matching remote versions\n");
         let rows = filter_remote_rows(&releases, true);
         assert!(rows
             .iter()

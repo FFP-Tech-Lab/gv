@@ -15,8 +15,8 @@ pub fn run(root: &Path, requested: &[String], force: bool) -> Result<(), Error> 
     for spec in requested {
         match uninstall_one(root, spec, force) {
             Ok(message) => println!("{message}"),
-            Err(Error::NotInstalled(name)) => println!("Go {name} 未安装"),
-            Err(err) => failures.push(format!("Go {spec} 卸载失败：{err}")),
+            Err(Error::NotInstalled(name)) => println!("Go {name} is not installed"),
+            Err(err) => failures.push(format!("Failed to uninstall Go {spec}: {err}")),
         }
     }
     if failures.is_empty() {
@@ -44,9 +44,11 @@ fn uninstall_one(root: &Path, requested: &str, force: bool) -> Result<String, Er
     fs::remove_dir_all(&dir)?;
     if points {
         fs::remove_file(store::global_version_path(root))?;
-        return Ok(format!("已卸载 Go {name}，并清除全局版本"));
+        return Ok(format!(
+            "Uninstalled Go {name} and cleared the global version"
+        ));
     }
-    Ok(format!("已卸载 Go {name}"))
+    Ok(format!("Uninstalled Go {name}"))
 }
 
 fn global_points_at(root: &Path, version: &Version) -> Result<bool, Error> {
@@ -82,12 +84,15 @@ mod tests {
         assert!(store::tool_exists(root.path(), "1.23.4", "go"));
 
         let message = uninstall_one(root.path(), "1.22.0", false).unwrap();
-        assert_eq!(message, "已卸载 Go 1.22.0");
+        assert_eq!(message, "Uninstalled Go 1.22.0");
         assert!(!store::tool_exists(root.path(), "1.22.0", "go"));
         assert!(store::tool_exists(root.path(), "1.23.4", "go"));
 
         let forced = uninstall_one(root.path(), "1.23.4", true).unwrap();
-        assert_eq!(forced, "已卸载 Go 1.23.4，并清除全局版本");
+        assert_eq!(
+            forced,
+            "Uninstalled Go 1.23.4 and cleared the global version"
+        );
         assert!(!root.path().join("version").exists());
         assert!(!store::version_dir(root.path(), "1.23.4").exists());
     }
@@ -156,8 +161,8 @@ mod tests {
         )
         .unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("Go 1.23 卸载失败"));
-        assert!(text.contains("不能只写 1.23"));
+        assert!(text.contains("Failed to uninstall Go 1.23"));
+        assert!(text.contains("not just 1.23"));
         assert!(text.contains("gv uninstall 1.23.4 --force"));
         assert!(!text.contains("9.9.9"));
         assert!(!store::tool_exists(root.path(), "1.22.5", "go"));

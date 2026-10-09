@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-const BASH: &str = r#"# 把这段输出放进 shell 配置。gv 不会修改 ~/.bashrc。
+const BASH: &str = r#"# Put this output in your shell config. gv will not modify ~/.bashrc.
 _gv() {
   local cur cmd versions line
   COMPREPLY=()
@@ -50,7 +50,7 @@ complete -F _gv gv
 "#;
 
 const ZSH: &str = r#"#compdef gv
-# 把这段输出放进 shell 配置。gv 不会修改 ~/.zshrc。
+# Put this output in your shell config. gv will not modify ~/.zshrc.
 _gv() {
   local -a commands versions
   commands=(install uninstall list list-remote use current which init completions clean shell)
@@ -125,9 +125,9 @@ mod tests {
             assert!(!text.contains("builtin cd"), "{shell}");
         }
         let bash = script("bash").unwrap();
-        assert!(bash.contains("不会修改 ~/.bashrc"));
+        assert!(bash.contains("will not modify ~/.bashrc"));
         let zsh = script("zsh").unwrap();
-        assert!(zsh.contains("不会修改 ~/.zshrc"));
+        assert!(zsh.contains("will not modify ~/.zshrc"));
         assert!(script("fish").unwrap_err().to_string().contains("bash"));
     }
 }

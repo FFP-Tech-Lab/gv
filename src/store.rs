@@ -68,7 +68,7 @@ pub fn cache_dir(root: &Path) -> PathBuf {
     root.join("cache")
 }
 
-/// 官方 SDK 压缩包缓存。索引 JSON 仍放在 `cache/` 下，不在这个目录里。
+/// Cache of official SDK archives. Index JSON stays under `cache/` and is not in this directory.
 pub fn archive_cache_dir(root: &Path) -> PathBuf {
     cache_dir(root).join("archives")
 }

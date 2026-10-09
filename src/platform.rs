@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-/// Go 发行包使用的操作系统与架构名称。
+/// Operating system and architecture names used by Go release archives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Platform {
     pub os: String,
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn rejects_windows_and_unknown_arch() {
         let err = Platform::detect("windows", "x86_64").unwrap_err();
-        assert!(err.to_string().contains("不支持的平台"));
+        assert!(err.to_string().contains("Unsupported platform"));
         assert!(Platform::detect("linux", "powerpc64").is_err());
     }
 
