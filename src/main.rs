@@ -3,6 +3,8 @@
 mod commands;
 mod download;
 mod error;
+#[cfg(feature = "tui")]
+mod pick;
 mod platform;
 mod resolve;
 mod shim;
@@ -14,6 +16,7 @@ mod testutil;
 
 use std::env;
 use std::future::Future;
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -42,8 +45,8 @@ enum Command {
         /// Skip progress bars and print one line of transferred bytes when each version finishes
         #[arg(short, long)]
         quiet: bool,
-        /// Version numbers; more than one may be passed
-        #[arg(required = true, value_name = "VERSION")]
+        /// Versions to install. Omit them in a terminal to choose one
+        #[arg(value_name = "VERSION")]
         versions: Vec<String>,
     },
     /// Uninstall one or more Go versions
@@ -175,12 +178,22 @@ fn run() -> Result<(), RunError> {
 
     match cli.command {
         Command::Install { versions, quiet } => {
-            block_on(commands::install::run(&root, &versions, quiet))
-                .map_err(|error| RunError {
+            let Some(versions) =
+                resolve_install_versions(&root, versions, quiet).map_err(|error| RunError {
                     error,
                     quiet,
                     shim: false,
-                })?;
+                })?
+            else {
+                return Ok(());
+            };
+            block_on(commands::install::run(&root, &versions, quiet)).map_err(|error| {
+                RunError {
+                    error,
+                    quiet,
+                    shim: false,
+                }
+            })?;
         }
         Command::Uninstall { versions, force } => {
             commands::uninstall::run(&root, &versions, force)?;
@@ -217,7 +230,11 @@ fn run() -> Result<(), RunError> {
             unset,
         } => {
             let cwd = env::current_dir()?;
-            let version = commands::take_version(version, unset)?;
+            let version = match resolve_use_version(&root, &cwd, version, unset)? {
+                UseRequest::Ready(version) => version,
+                #[cfg(feature = "tui")]
+                UseRequest::Cancel => return Ok(()),
+            };
             let outcome = commands::use_version::run(&root, &cwd, version.as_deref(), global)?;
             let tone = if outcome.notice {
                 Tone::Notice
@@ -260,6 +277,71 @@ fn run() -> Result<(), RunError> {
         }
     }
     Ok(())
+}
+
+fn resolve_install_versions(
+    root: &Path,
+    versions: Vec<String>,
+    quiet: bool,
+) -> Result<Option<Vec<String>>, Error> {
+    if !versions.is_empty() {
+        return Ok(Some(versions));
+    }
+    pick_install_version(root, quiet)
+}
+
+#[cfg(feature = "tui")]
+fn pick_install_version(root: &Path, quiet: bool) -> Result<Option<Vec<String>>, Error> {
+    if !ui::Ui::detect(quiet).animated() {
+        return Err(Error::InstallVersionRequired);
+    }
+    match block_on(pick::choose_remote(root))? {
+        Some(version) => Ok(Some(vec![version])),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "tui"))]
+fn pick_install_version(_root: &Path, _quiet: bool) -> Result<Option<Vec<String>>, Error> {
+    Err(Error::InstallVersionRequired)
+}
+
+enum UseRequest {
+    #[cfg(feature = "tui")]
+    Cancel,
+    Ready(Option<String>),
+}
+
+fn resolve_use_version(
+    root: &Path,
+    cwd: &Path,
+    version: Option<String>,
+    unset: bool,
+) -> Result<UseRequest, Error> {
+    if version.is_none() && !unset {
+        if let Some(request) = pick_use_version(root, cwd)? {
+            return Ok(request);
+        }
+    }
+    Ok(UseRequest::Ready(commands::take_version(version, unset)?))
+}
+
+#[cfg(feature = "tui")]
+fn pick_use_version(root: &Path, cwd: &Path) -> Result<Option<UseRequest>, Error> {
+    if !ui::Ui::detect(false).animated() {
+        return Ok(None);
+    }
+    let gv_version = env::var("GV_VERSION").ok();
+    let request = match pick::choose_installed(root, cwd, gv_version.as_deref())? {
+        Some(version) => UseRequest::Ready(Some(version)),
+        None => UseRequest::Cancel,
+    };
+    Ok(Some(request))
+}
+
+#[cfg(not(feature = "tui"))]
+fn pick_use_version(_root: &Path, _cwd: &Path) -> Result<Option<UseRequest>, Error> {
+    Ok(None)
 }
 
 fn block_on<T>(future: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {

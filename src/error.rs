@@ -65,6 +65,9 @@ pub enum Error {
     #[error("Specify a version, or use --unset")]
     VersionRequired,
 
+    #[error("Specify a version to install")]
+    InstallVersionRequired,
+
     #[error("Failed to parse the index: {0}")]
     IndexParse(String),
 
