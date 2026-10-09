@@ -204,7 +204,12 @@ fn run() -> Result<(), RunError> {
             let cwd = env::current_dir()?;
             let version = commands::take_version(version, unset)?;
             let outcome = commands::use_version::run(&root, &cwd, version.as_deref(), global)?;
-            println!("{}", outcome.message);
+            let tone = if outcome.notice {
+                Tone::Notice
+            } else {
+                Tone::Done
+            };
+            ui::Ui::detect(false).finish(tone, &outcome.message);
             if let Some(hint) = outcome.hint {
                 eprintln!("gv: {hint}");
             }

@@ -9,6 +9,7 @@ use crate::store;
 pub struct UseOutcome {
     pub message: String,
     pub hint: Option<String>,
+    pub notice: bool,
 }
 
 pub fn run(
@@ -45,7 +46,11 @@ pub fn run(
     } else {
         format!("Set the Go version in the current directory to {spec}")
     };
-    Ok(UseOutcome { message, hint })
+    Ok(UseOutcome {
+        message,
+        hint,
+        notice: false,
+    })
 }
 
 fn unset(root: &Path, cwd: &Path, global: bool) -> Result<UseOutcome, Error> {
@@ -63,6 +68,7 @@ fn unset(root: &Path, cwd: &Path, global: bool) -> Result<UseOutcome, Error> {
         return Ok(UseOutcome {
             message,
             hint: None,
+            notice: true,
         });
     }
     fs::remove_file(&path)?;
@@ -74,6 +80,7 @@ fn unset(root: &Path, cwd: &Path, global: bool) -> Result<UseOutcome, Error> {
     Ok(UseOutcome {
         message,
         hint: None,
+        notice: false,
     })
 }
 
@@ -93,6 +100,7 @@ mod tests {
             outcome.message,
             "Set the Go version in the current directory to 1.23.4"
         );
+        assert!(!outcome.notice);
         assert!(outcome.hint.is_none());
         assert_eq!(
             fs::read_to_string(cwd.path().join(".go-version")).unwrap(),
@@ -101,6 +109,7 @@ mod tests {
 
         let global = run(root.path(), cwd.path(), Some("1.22"), true).unwrap();
         assert_eq!(global.message, "Set the global Go version to 1.22");
+        assert!(!global.notice);
         assert!(global.hint.unwrap().contains("gv install 1.22"));
         assert_eq!(
             fs::read_to_string(root.path().join("version")).unwrap(),
@@ -122,6 +131,7 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         let missing = run(root.path(), &other, None, false).unwrap();
         assert_eq!(missing.message, "No .go-version in the current directory");
+        assert!(missing.notice);
         assert!(parent.path().join(".go-version").is_file());
 
         let removed = run(root.path(), &child, None, false).unwrap();
@@ -129,6 +139,7 @@ mod tests {
             removed.message,
             "Removed .go-version from the current directory"
         );
+        assert!(!removed.notice);
         assert!(!child.join(".go-version").exists());
         assert_eq!(
             fs::read_to_string(parent.path().join(".go-version")).unwrap(),
@@ -138,12 +149,15 @@ mod tests {
 
         let again = run(root.path(), &child, None, false).unwrap();
         assert_eq!(again.message, "No .go-version in the current directory");
+        assert!(again.notice);
 
         let global = run(root.path(), &child, None, true).unwrap();
         assert_eq!(global.message, "Removed the global version file");
+        assert!(!global.notice);
         assert!(!root.path().join("version").exists());
         let global_missing = run(root.path(), &child, None, true).unwrap();
         assert_eq!(global_missing.message, "No global version file");
+        assert!(global_missing.notice);
     }
 
     #[test]
