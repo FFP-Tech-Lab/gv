@@ -395,7 +395,12 @@ fn install_accepts_several_versions_and_skips_each_without_network() {
 
     let missing = gv(root.path()).arg("install").output().unwrap();
     assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("VERSION"));
+    assert!(missing.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
 }
 
 #[test]
@@ -819,12 +824,26 @@ fn list_remote_filters_and_marks_installed_versions() {
     seed_index(root.path(), &sample_remote_index());
     install_fake_sdk(root.path(), "1.24.0");
 
-    let exact = gv(root.path()).args(["list-remote", "1.24"]).output().unwrap();
-    assert!(exact.status.success(), "{}", String::from_utf8_lossy(&exact.stderr));
+    let exact = gv(root.path())
+        .args(["list-remote", "1.24"])
+        .output()
+        .unwrap();
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
     assert_eq!(String::from_utf8(exact.stdout).unwrap(), "* 1.24.0\n");
 
-    let minor = gv(root.path()).args(["list-remote", "1.22"]).output().unwrap();
-    assert!(minor.status.success(), "{}", String::from_utf8_lossy(&minor.stderr));
+    let minor = gv(root.path())
+        .args(["list-remote", "1.22"])
+        .output()
+        .unwrap();
+    assert!(
+        minor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&minor.stderr)
+    );
     assert_eq!(String::from_utf8(minor.stdout).unwrap(), "  1.22.5\n");
 }
 
@@ -841,7 +860,11 @@ fn list_remote_offline_uses_a_stale_cache_without_a_warning() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "offline list-remote contacted the network"
     );
-    assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
     assert!(text.stderr.is_empty());
     assert_eq!(
         String::from_utf8(text.stdout).unwrap(),
@@ -922,5 +945,52 @@ fn clean_removes_archive_cache_only() {
     assert_eq!(
         String::from_utf8(again.stdout).unwrap(),
         "No cached archives\n"
+    );
+}
+
+#[test]
+fn install_and_use_without_a_version_fail_when_output_is_piped() {
+    let root = TempDir::new();
+    let install = gv(root.path()).arg("install").output().unwrap();
+    assert!(!install.status.success());
+    assert!(install.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&install.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let quiet = gv(root.path())
+        .args(["install", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(!quiet.status.success());
+    assert!(quiet.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&quiet.stderr).contains("Specify a version to install"),
+        "{}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+
+    let use_cmd = gv(root.path()).arg("use").output().unwrap();
+    assert!(!use_cmd.status.success());
+    assert!(use_cmd.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&use_cmd.stderr).contains("Specify a version, or use --unset"),
+        "{}",
+        String::from_utf8_lossy(&use_cmd.stderr)
+    );
+
+    let dumb = gv(root.path())
+        .env("TERM", "dumb")
+        .arg("use")
+        .output()
+        .unwrap();
+    assert!(!dumb.status.success());
+    assert!(dumb.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&dumb.stderr).contains("Specify a version, or use --unset"),
+        "{}",
+        String::from_utf8_lossy(&dumb.stderr)
     );
 }

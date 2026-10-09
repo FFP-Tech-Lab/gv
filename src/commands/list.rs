@@ -93,6 +93,37 @@ fn json_line(value: &serde_json::Value) -> Result<String, Error> {
     Ok(text)
 }
 
+pub struct RemoteRows {
+    pub rows: Vec<RemoteVersion>,
+    pub warning: Option<String>,
+}
+
+pub async fn load_remote_rows(
+    root: &Path,
+    all: bool,
+    policy: IndexPolicy,
+    prefix: Option<&str>,
+) -> Result<RemoteRows, Error> {
+    let url = store::index_url();
+    let client = download::http_client()?;
+    let loaded = download::load_index(&client, root, &url, policy, SystemTime::now()).await?;
+    let installed: HashSet<String> = resolve::installed_versions(root)?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    let mut rows = download::filter_remote_rows(&loaded.releases, all);
+    if let Some(prefix) = prefix.filter(|prefix| !prefix.trim().is_empty()) {
+        rows.retain(|row| download::remote_version_matches(&row.version, prefix));
+    }
+    for row in &mut rows {
+        row.installed = installed.contains(&row.version);
+    }
+    Ok(RemoteRows {
+        rows,
+        warning: loaded.warning,
+    })
+}
+
 pub async fn remote(
     root: &Path,
     all: bool,
@@ -113,26 +144,13 @@ pub async fn remote(
     } else {
         IndexPolicy::RefreshIfStale
     };
-    let url = store::index_url();
-    let client = download::http_client()?;
-    let loaded = download::load_index(&client, root, &url, policy, SystemTime::now()).await?;
+    let loaded = load_remote_rows(root, all, policy, prefix).await?;
     if let Some(warning) = &loaded.warning {
         eprintln!("gv: {warning}");
     }
-    let installed: HashSet<String> = resolve::installed_versions(root)?
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    let mut rows = download::filter_remote_rows(&loaded.releases, all);
-    if let Some(prefix) = prefix.filter(|prefix| !prefix.trim().is_empty()) {
-        rows.retain(|row| download::remote_version_matches(&row.version, prefix));
-    }
-    for row in &mut rows {
-        row.installed = installed.contains(&row.version);
-    }
     let text = match output {
-        OutputFormat::Text => download::format_remote(&rows),
-        OutputFormat::Json => format_remote_json(&rows)?,
+        OutputFormat::Text => download::format_remote(&loaded.rows),
+        OutputFormat::Json => format_remote_json(&loaded.rows)?,
     };
     print!("{text}");
     Ok(())
