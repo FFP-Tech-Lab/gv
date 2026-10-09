@@ -158,7 +158,7 @@ eval "$(gv shell 1.23.4)"
 
 压缩包是顶层目录为 `go/` 的 `.tar.gz`。每个版本先写入 `$GV_ROOT/cache/archives/`。缓存文件的 SHA256 与索引一致时会直接复用。校验通过后解压到临时目录。校验失败会删除该缓存文件。
 
-下载时，终端会显示已传输字节、速度和预计剩余时间。stderr 不是终端、`TERM=dumb`，或传入 `--quiet` 时，不画进度条，下载结束后打印一行已传输字节数。未使用 `--quiet` 时，命中缓存会打印 `Using cached archive <filename>`，解压前会打印 `Extracting Go <version>`。一次安装多个版本时会同时下载这些压缩包，最多同时 3 个：终端为每个版本显示一条进度条，非终端则为每个版本打印一行已传输字节数。传输中断时会保留 `cache/archives/.partial-<filename>`，并再试两次，间隔 200ms 和 400ms。重试只覆盖连接失败、超时和 HTTP 5xx。服务器返回 `206` 时从已保存的字节继续。校验失败、HTTP 404 和不安全路径不会重试。只新装了一个版本、且它不是当前生效版本时，gv 会提示运行 `gv use <version>`。
+下载时，终端会显示已传输字节、速度和预计剩余时间。终端在拉取版本索引、检查缓存压缩包（`Using cached archive <filename>`）和解压（`Extracting Go <version>`）时还会显示转圈。转圈在 80ms 后才出现第一帧。这一行随后变成 `✔`、`•` 或 `✖` 加上原来的结果句子。`✔` 为绿色，`✖` 为红色，`•` 不着色。设置 `NO_COLOR` 时仍有这些符号，只是没有颜色。`gv uninstall`、`gv use`、`gv clean` 和 `gv list-remote` 使用同一套标记。`gv list-remote` 只在下载索引时转圈，打印版本列表前清掉那一行。stderr 不是终端、`TERM=dumb`，或传入 `--quiet` 时，不画进度条也不转圈，不打印这些符号，下载结束后打印一行已传输字节数。未使用 `--quiet` 时，命中缓存会打印 `Using cached archive <filename>`，解压前会打印 `Extracting Go <version>`。一次安装多个版本时会同时下载这些压缩包，最多同时 3 个：终端为每个版本显示一条进度条，非终端则为每个版本打印一行已传输字节数。传输中断时会保留 `cache/archives/.partial-<filename>`，并再试两次，间隔 200ms 和 400ms。重试只覆盖连接失败、超时和 HTTP 5xx。服务器返回 `206` 时从已保存的字节继续。校验失败、HTTP 404 和不安全路径不会重试。只新装了一个版本、且它不是当前生效版本时，gv 会提示运行 `gv use <version>`。
 
 包含 `..` 的路径、绝对路径或不安全的链接目标会被拒绝。通过这些检查之后，临时目录才会原子地重命名为 `versions/<version>`。`gv clean` 只删除 `cache/archives/` 里的压缩包。
 
