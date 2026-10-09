@@ -237,7 +237,7 @@ fn run() -> Result<(), RunError> {
             print!("{}", commands::completions::script(&shell)?);
         }
         Command::Clean => {
-            print!("{}", commands::clean::run(&root)?);
+            commands::clean::run(&root)?;
         }
         Command::Shell { version, unset } => {
             let version = commands::take_version(version, unset)?;
