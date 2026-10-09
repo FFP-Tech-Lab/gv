@@ -133,7 +133,7 @@ fn use_current_list_and_resolution_order() {
         String::from_utf8_lossy(&current.stderr)
     );
     let stdout = String::from_utf8(current.stdout).unwrap();
-    assert!(stdout.starts_with("1.23.10（.go-version:"), "{stdout}");
+    assert!(stdout.starts_with("1.23.10 (.go-version:"), "{stdout}");
 
     let overridden = gv(root.path())
         .current_dir(&nested)
@@ -143,7 +143,7 @@ fn use_current_list_and_resolution_order() {
         .unwrap();
     let stdout = String::from_utf8(overridden.stdout).unwrap();
     assert!(
-        stdout.starts_with("1.22.2（环境变量 GV_VERSION）"),
+        stdout.starts_with("1.22.2 (environment variable GV_VERSION)"),
         "{stdout}"
     );
 
@@ -174,7 +174,7 @@ fn use_current_list_and_resolution_order() {
         .output()
         .unwrap();
     let stdout = String::from_utf8(current.stdout).unwrap();
-    assert!(stdout.starts_with("1.22.2（全局:"), "{stdout}");
+    assert!(stdout.starts_with("1.22.2 (global:"), "{stdout}");
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn uninstall_removes_each_given_version() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "已卸载 Go 1.22.5\n已卸载 Go 1.23.4\n"
+        "Uninstalled Go 1.22.5\nUninstalled Go 1.23.4\n"
     );
     assert!(output.stderr.is_empty());
     assert!(!root.path().join("versions/1.22.5").exists());
@@ -274,12 +274,12 @@ fn uninstall_continues_after_failure_and_notices_missing_versions() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "已卸载 Go 1.22.5\nGo 9.9.9 未安装\n已卸载 Go 1.21.0\n"
+        "Uninstalled Go 1.22.5\nGo 9.9.9 is not installed\nUninstalled Go 1.21.0\n"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
-        "gv: Go 1.23 卸载失败：请指定完整版本号，不能只写 1.23\n\
-         gv: Go 1.23.4 卸载失败：全局版本正指向 1.23.4。如需卸载请运行 gv uninstall 1.23.4 --force\n"
+        "gv: Failed to uninstall Go 1.23: Specify a full version, not just 1.23\n\
+         gv: Failed to uninstall Go 1.23.4: The global version points at 1.23.4. To uninstall it, run gv uninstall 1.23.4 --force\n"
     );
     assert!(!root.path().join("versions/1.22.5").exists());
     assert!(root.path().join("versions/1.23.4/go/bin/go").is_file());
@@ -315,7 +315,7 @@ fn uninstall_force_clears_global_pin_among_several_versions() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "已卸载 Go 1.22.5\n已卸载 Go 1.23.4，并清除全局版本\n"
+        "Uninstalled Go 1.22.5\nUninstalled Go 1.23.4 and cleared the global version\n"
     );
     assert!(output.stderr.is_empty());
     assert!(!root.path().join("versions/1.22.5").exists());
@@ -338,7 +338,7 @@ fn already_installed_does_not_contact_the_network() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Go 1.2.3 已安装\n"
+        "Go 1.2.3 is already installed\n"
     );
     assert!(output.stderr.is_empty());
 
@@ -353,7 +353,7 @@ fn already_installed_does_not_contact_the_network() {
     );
     assert_eq!(
         String::from_utf8(quiet.stdout).unwrap(),
-        "Go 1.2.3 已安装\n"
+        "Go 1.2.3 is already installed\n"
     );
     assert!(quiet.stderr.is_empty());
 }
@@ -375,7 +375,7 @@ fn install_accepts_several_versions_and_skips_each_without_network() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Go 1.22.5 已安装\nGo 1.23.4 已安装\n"
+        "Go 1.22.5 is already installed\nGo 1.23.4 is already installed\n"
     );
     assert!(output.stderr.is_empty());
 
@@ -390,7 +390,7 @@ fn install_accepts_several_versions_and_skips_each_without_network() {
     );
     assert_eq!(
         String::from_utf8(quiet.stdout).unwrap(),
-        "Go 1.23.4 已安装\nGo 1.22.5 已安装\n"
+        "Go 1.23.4 is already installed\nGo 1.22.5 is already installed\n"
     );
 
     let missing = gv(root.path()).arg("install").output().unwrap();
@@ -411,7 +411,7 @@ fn install_reports_each_failure_and_still_skips_installed_versions() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Go 1.23.4 已安装\nGo 1.22.5 已安装\n"
+        "Go 1.23.4 is already installed\nGo 1.22.5 is already installed\n"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     let lines: Vec<&str> = stderr.lines().collect();
@@ -427,7 +427,7 @@ fn install_reports_each_failure_and_still_skips_installed_versions() {
             .any(|line| line.starts_with("gv: ") && line.contains("also-bad")),
         "{stderr}"
     );
-    assert!(stderr.contains("无法识别的版本号"), "{stderr}");
+    assert!(stderr.contains("Unrecognized version"), "{stderr}");
     assert!(root.path().join("versions/1.22.5/go/bin/go").is_file());
     assert!(root.path().join("versions/1.23.4/go/bin/go").is_file());
 }
@@ -570,7 +570,7 @@ fn which_prints_source_and_tool_paths() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.starts_with("1.23.10（.go-version:"), "{stdout}");
+    assert!(stdout.starts_with("1.23.10 (.go-version:"), "{stdout}");
     assert!(
         stdout.contains(&format!("versions/1.23.10/go/bin/go")),
         "{stdout}"
@@ -600,7 +600,7 @@ fn completions_are_print_only() {
     assert!(text.contains("list-remote"));
     assert!(text.contains("gv list"));
     assert!(text.contains("latest"));
-    assert!(text.contains("不会修改 ~/.bashrc"));
+    assert!(text.contains("will not modify ~/.bashrc"));
     assert!(!text.contains("cd "));
     assert!(!text.contains(">>"));
 
@@ -610,7 +610,7 @@ fn completions_are_print_only() {
         .unwrap();
     assert!(zsh.status.success());
     let text = String::from_utf8(zsh.stdout).unwrap();
-    assert!(text.contains("不会修改 ~/.zshrc"));
+    assert!(text.contains("will not modify ~/.zshrc"));
     assert!(text.contains("gv list"));
     assert!(!text.contains("cd "));
 
@@ -651,11 +651,12 @@ fn shell_prints_export_or_unset() {
         .output()
         .unwrap();
     assert!(!both.status.success());
-    assert!(String::from_utf8_lossy(&both.stderr).contains("不能同时指定版本和 --unset"));
+    assert!(String::from_utf8_lossy(&both.stderr)
+        .contains("Cannot specify a version and --unset together"));
 
     let latest = gv(root.path()).args(["shell", "latest"]).output().unwrap();
     assert!(!latest.status.success());
-    assert!(String::from_utf8_lossy(&latest.stderr).contains("无法识别的版本号"));
+    assert!(String::from_utf8_lossy(&latest.stderr).contains("Unrecognized version"));
 }
 
 #[test]
@@ -686,7 +687,7 @@ fn use_unset_deletes_only_the_local_pin() {
     );
     assert_eq!(
         String::from_utf8(removed.stdout).unwrap(),
-        "已删除当前目录的 .go-version\n"
+        "Removed .go-version from the current directory\n"
     );
     assert!(!child.join(".go-version").exists());
     assert_eq!(
@@ -702,7 +703,7 @@ fn use_unset_deletes_only_the_local_pin() {
     assert!(missing.status.success());
     assert_eq!(
         String::from_utf8(missing.stdout).unwrap(),
-        "当前目录没有 .go-version\n"
+        "No .go-version in the current directory\n"
     );
 
     let global = gv(root.path())
@@ -820,7 +821,7 @@ fn install_latest_uses_highest_stable_and_skips_when_present() {
     );
     assert_eq!(
         String::from_utf8(skipped.stdout).unwrap(),
-        "Go 1.24.0 已安装\n"
+        "Go 1.24.0 is already installed\n"
     );
     assert!(skipped.stderr.is_empty());
 
@@ -832,12 +833,12 @@ fn install_latest_uses_highest_stable_and_skips_when_present() {
     assert!(!output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "Go 1.22.5 已安装\n"
+        "Go 1.22.5 is already installed\n"
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("go1.24.0."), "{stderr}");
     assert!(!stderr.contains("1.25rc1"), "{stderr}");
-    assert!(!stderr.contains("无法识别的版本号"), "{stderr}");
+    assert!(!stderr.contains("Unrecognized version"), "{stderr}");
     assert!(root.path().join("versions/1.22.5/go/bin/go").is_file());
 }
 
@@ -862,7 +863,7 @@ fn clean_removes_archive_cache_only() {
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "已删除 1 个安装包缓存\n"
+        "Removed 1 cached archive\n"
     );
     assert!(!cache
         .join("archives")
@@ -872,5 +873,8 @@ fn clean_removes_archive_cache_only() {
     assert!(root.path().join("versions/1.23.4/go/bin/go").is_file());
 
     let again = gv(root.path()).arg("clean").output().unwrap();
-    assert_eq!(String::from_utf8(again.stdout).unwrap(), "没有安装包缓存\n");
+    assert_eq!(
+        String::from_utf8(again.stdout).unwrap(),
+        "No cached archives\n"
+    );
 }

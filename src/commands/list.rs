@@ -39,7 +39,7 @@ pub fn installed_report(
 
 pub fn format_installed(versions: &[String], current: Option<&str>) -> String {
     if versions.is_empty() {
-        return "没有已安装的 Go 版本\n".to_string();
+        return "No Go versions are installed\n".to_string();
     }
     let mut out = String::new();
     for version in versions {
@@ -133,7 +133,7 @@ mod tests {
         let root = TempDir::new();
         let cwd = TempDir::new();
         let empty = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
-        assert_eq!(empty.stdout, "没有已安装的 Go 版本\n");
+        assert_eq!(empty.stdout, "No Go versions are installed\n");
         assert!(empty.warning.is_none());
 
         touch_sdk(root.path(), "1.22.1");

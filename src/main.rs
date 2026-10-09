@@ -23,10 +23,10 @@ use crate::error::Error;
 #[command(
     name = "gv",
     version,
-    about = "Go 版本管理器",
+    about = "Go version manager",
     subcommand_required = true,
     arg_required_else_help = true,
-    after_long_help = "示例：\n  gv install 1.23.4\n  gv install latest\n  gv install 1.22.5 1.23.4\n  gv uninstall 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --unset\n  gv use --global 1.23.4\n  gv use --global --unset\n  gv which\n  gv clean\n  eval \"$(gv init bash)\"\n  eval \"$(gv completions bash)\"\n  eval \"$(gv shell 1.23.4)\""
+    after_long_help = "Examples:\n  gv install 1.23.4\n  gv install latest\n  gv install 1.22.5 1.23.4\n  gv uninstall 1.22.5 1.23.4\n  gv use 1.23.4\n  gv use --unset\n  gv use --global 1.23.4\n  gv use --global --unset\n  gv which\n  gv clean\n  eval \"$(gv init bash)\"\n  eval \"$(gv completions bash)\"\n  eval \"$(gv shell 1.23.4)\""
 )]
 struct Cli {
     #[command(subcommand)]
@@ -35,69 +35,69 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 下载并安装一个或多个 Go 版本
+    /// Download and install one or more Go versions
     Install {
-        /// 不绘制进度条，每个版本结束时只打印一行已传输字节数
+        /// Skip progress bars and print one line of transferred bytes when each version finishes
         #[arg(short, long)]
         quiet: bool,
-        /// 版本号，可一次传入多个
+        /// Version numbers; more than one may be passed
         #[arg(required = true, value_name = "VERSION")]
         versions: Vec<String>,
     },
-    /// 卸载一个或多个 Go 版本
+    /// Uninstall one or more Go versions
     Uninstall {
-        /// 全局版本指向待卸载版本时仍卸载，并清除全局版本文件
+        /// Uninstall even when the global version points at a target, and clear the global version file
         #[arg(long)]
         force: bool,
-        /// 版本号，可一次传入多个
+        /// Version numbers; more than one may be passed
         #[arg(required = true, value_name = "VERSION")]
         versions: Vec<String>,
     },
-    /// 列出已安装的版本
+    /// List installed versions
     List {
-        /// 输出格式：text 或 json
+        /// Output format: text or json
         #[arg(long, value_enum, default_value = "text")]
         output: commands::list::OutputFormat,
     },
-    /// 列出可安装的远端版本
+    /// List remote versions that can be installed
     #[command(name = "list-remote")]
     ListRemote {
-        /// 包含 beta、rc 等非 stable 版本
+        /// Include non-stable versions such as beta and rc
         #[arg(long)]
         all: bool,
-        /// 忽略本地缓存，重新下载索引
+        /// Ignore the local cache and download the index again
         #[arg(long)]
         refresh: bool,
-        /// 输出格式：text 或 json
+        /// Output format: text or json
         #[arg(long, value_enum, default_value = "text")]
         output: commands::list::OutputFormat,
     },
-    /// 选择 Go 版本
+    /// Select a Go version
     Use {
-        /// 版本号。与 --unset 一起使用时会报错
+        /// Version number. Errors when combined with --unset
         version: Option<String>,
-        /// 写入全局版本，而不是当前目录的 .go-version
+        /// Write the global version instead of .go-version in the current directory
         #[arg(long)]
         global: bool,
-        /// 删除当前目录的 .go-version，或与 --global 一起删除全局版本文件
+        /// Remove .go-version in the current directory, or the global version file with --global
         #[arg(long)]
         unset: bool,
     },
-    /// 显示当前生效的版本和来源
+    /// Show the active version and where it came from
     Current,
-    /// 打印当前版本、来源，以及 go 与 gofmt 的路径
+    /// Print the current version, its source, and the paths of go and gofmt
     Which,
-    /// 打印 bash 或 zsh 的初始化片段
+    /// Print the bash or zsh init snippet
     Init { shell: String },
-    /// 打印 bash 或 zsh 的补全脚本
+    /// Print the bash or zsh completion script
     Completions { shell: String },
-    /// 删除安装包缓存，不删除已安装的版本
+    /// Delete cached archives without removing installed versions
     Clean,
-    /// 打印 export GV_VERSION 或取消该变量的语句
+    /// Print an export GV_VERSION statement, or a statement that unsets it
     Shell {
-        /// 版本号。与 --unset 一起使用时会报错
+        /// Version number. Errors when combined with --unset
         version: Option<String>,
-        /// 打印取消 GV_VERSION 的语句
+        /// Print a statement that unsets GV_VERSION
         #[arg(long)]
         unset: bool,
     },

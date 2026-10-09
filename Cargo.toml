@@ -2,7 +2,7 @@
 name = "gv"
 version = "0.1.0"
 edition = "2021"
-description = "Go 版本管理器"
+description = "Go version manager"
 license = "MIT"
 authors = ["FFP Tech Lab"]
 repository = "https://github.com/FFP-Tech-Lab/gv"

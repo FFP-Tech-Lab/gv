@@ -37,13 +37,13 @@ pub fn run(
         None
     } else {
         Some(format!(
-            "尚未安装该版本，运行 go 前请先执行 gv install {spec}"
+            "This version is not installed yet. Run gv install {spec} before using go"
         ))
     };
     let message = if global {
-        format!("已将全局 Go 版本设为 {spec}")
+        format!("Set the global Go version to {spec}")
     } else {
-        format!("已将当前目录的 Go 版本设为 {spec}")
+        format!("Set the Go version in the current directory to {spec}")
     };
     Ok(UseOutcome { message, hint })
 }
@@ -56,9 +56,9 @@ fn unset(root: &Path, cwd: &Path, global: bool) -> Result<UseOutcome, Error> {
     };
     if !path.exists() {
         let message = if global {
-            "没有全局版本文件".to_string()
+            "No global version file".to_string()
         } else {
-            "当前目录没有 .go-version".to_string()
+            "No .go-version in the current directory".to_string()
         };
         return Ok(UseOutcome {
             message,
@@ -67,9 +67,9 @@ fn unset(root: &Path, cwd: &Path, global: bool) -> Result<UseOutcome, Error> {
     }
     fs::remove_file(&path)?;
     let message = if global {
-        "已删除全局版本文件".to_string()
+        "Removed the global version file".to_string()
     } else {
-        "已删除当前目录的 .go-version".to_string()
+        "Removed .go-version from the current directory".to_string()
     };
     Ok(UseOutcome {
         message,
@@ -89,7 +89,10 @@ mod tests {
         let cwd = TempDir::new();
         touch_sdk(root.path(), "1.23.4");
         let outcome = run(root.path(), cwd.path(), Some("go1.23.4"), false).unwrap();
-        assert_eq!(outcome.message, "已将当前目录的 Go 版本设为 1.23.4");
+        assert_eq!(
+            outcome.message,
+            "Set the Go version in the current directory to 1.23.4"
+        );
         assert!(outcome.hint.is_none());
         assert_eq!(
             fs::read_to_string(cwd.path().join(".go-version")).unwrap(),
@@ -97,7 +100,7 @@ mod tests {
         );
 
         let global = run(root.path(), cwd.path(), Some("1.22"), true).unwrap();
-        assert_eq!(global.message, "已将全局 Go 版本设为 1.22");
+        assert_eq!(global.message, "Set the global Go version to 1.22");
         assert!(global.hint.unwrap().contains("gv install 1.22"));
         assert_eq!(
             fs::read_to_string(root.path().join("version")).unwrap(),
@@ -118,11 +121,14 @@ mod tests {
         let other = parent.path().join("other");
         fs::create_dir_all(&other).unwrap();
         let missing = run(root.path(), &other, None, false).unwrap();
-        assert_eq!(missing.message, "当前目录没有 .go-version");
+        assert_eq!(missing.message, "No .go-version in the current directory");
         assert!(parent.path().join(".go-version").is_file());
 
         let removed = run(root.path(), &child, None, false).unwrap();
-        assert_eq!(removed.message, "已删除当前目录的 .go-version");
+        assert_eq!(
+            removed.message,
+            "Removed .go-version from the current directory"
+        );
         assert!(!child.join(".go-version").exists());
         assert_eq!(
             fs::read_to_string(parent.path().join(".go-version")).unwrap(),
@@ -131,13 +137,13 @@ mod tests {
         assert!(root.path().join("version").is_file());
 
         let again = run(root.path(), &child, None, false).unwrap();
-        assert_eq!(again.message, "当前目录没有 .go-version");
+        assert_eq!(again.message, "No .go-version in the current directory");
 
         let global = run(root.path(), &child, None, true).unwrap();
-        assert_eq!(global.message, "已删除全局版本文件");
+        assert_eq!(global.message, "Removed the global version file");
         assert!(!root.path().join("version").exists());
         let global_missing = run(root.path(), &child, None, true).unwrap();
-        assert_eq!(global_missing.message, "没有全局版本文件");
+        assert_eq!(global_missing.message, "No global version file");
     }
 
     #[test]
@@ -145,7 +151,7 @@ mod tests {
         let root = TempDir::new();
         let cwd = TempDir::new();
         let err = run(root.path(), cwd.path(), Some("latest"), false).unwrap_err();
-        assert!(err.to_string().contains("无法识别的版本号"));
+        assert!(err.to_string().contains("Unrecognized version"));
         assert!(!cwd.path().join(".go-version").exists());
     }
 }

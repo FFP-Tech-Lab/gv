@@ -17,7 +17,7 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
     let query = resolve::parse_install_spec(requested)?;
     if let VersionQuery::Exact(version) = &query {
         if store::tool_exists(root, &version.to_string(), "go") {
-            println!("Go {version} 已安装");
+            println!("Go {version} is already installed");
             return Ok(());
         }
     }
@@ -37,7 +37,7 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
 
     let version = plan.version.to_string();
     if store::tool_exists(root, &version, "go") {
-        println!("Go {version} 已安装");
+        println!("Go {version} is already installed");
         return Ok(());
     }
 
@@ -51,10 +51,12 @@ async fn install_one(root: &Path, requested: &str, quiet: bool) -> Result<(), Er
     )
     .await;
     match results.into_iter().next() {
-        Some(Ok((_, InstallStatus::Installed))) => println!("已安装 Go {version}"),
-        Some(Ok((_, InstallStatus::AlreadyPresent))) => println!("Go {version} 已安装"),
+        Some(Ok((_, InstallStatus::Installed))) => println!("Installed Go {version}"),
+        Some(Ok((_, InstallStatus::AlreadyPresent))) => {
+            println!("Go {version} is already installed")
+        }
         Some(Err((_, err))) => return Err(err),
-        None => return Err(Error::Failed("没有安装结果".into())),
+        None => return Err(Error::Failed("no install result".into())),
     }
     Ok(())
 }
@@ -67,13 +69,13 @@ async fn install_many(root: &Path, requested: &[String], quiet: bool) -> Result<
             Ok(VersionQuery::Exact(version)) => {
                 let name = version.to_string();
                 if store::tool_exists(root, &name, "go") {
-                    println!("Go {name} 已安装");
+                    println!("Go {name} is already installed");
                 } else {
                     pending.push(spec.clone());
                 }
             }
             Ok(VersionQuery::Minor { .. } | VersionQuery::Latest) => pending.push(spec.clone()),
-            Err(err) => failures.push(format!("Go {spec} 安装失败：{err}")),
+            Err(err) => failures.push(format!("Failed to install Go {spec}: {err}")),
         }
     }
 
@@ -83,7 +85,7 @@ async fn install_many(root: &Path, requested: &[String], quiet: bool) -> Result<
             Err(err) => {
                 let text = err.to_string();
                 for spec in &pending {
-                    failures.push(format!("Go {spec} 安装失败：{text}"));
+                    failures.push(format!("Failed to install Go {spec}: {text}"));
                 }
             }
         }
@@ -118,7 +120,7 @@ async fn install_pending(
             {
                 refresh_needed.push(spec.clone());
             }
-            Err(err) => failures.push(format!("Go {spec} 安装失败：{err}")),
+            Err(err) => failures.push(format!("Failed to install Go {spec}: {err}")),
         }
     }
 
@@ -128,14 +130,14 @@ async fn install_pending(
                 for spec in refresh_needed {
                     match download::plan_install(&fresh.releases, &spec, &platform, &mirror) {
                         Ok(plan) => queue_plan(&mut plans, &mut seen, root, plan),
-                        Err(err) => failures.push(format!("Go {spec} 安装失败：{err}")),
+                        Err(err) => failures.push(format!("Failed to install Go {spec}: {err}")),
                     }
                 }
             }
             Err(err) => {
                 let text = err.to_string();
                 for spec in refresh_needed {
-                    failures.push(format!("Go {spec} 安装失败：{text}"));
+                    failures.push(format!("Failed to install Go {spec}: {text}"));
                 }
             }
         }
@@ -152,9 +154,11 @@ async fn install_pending(
     .await
     {
         match item {
-            Ok((version, InstallStatus::Installed)) => println!("已安装 Go {version}"),
-            Ok((version, InstallStatus::AlreadyPresent)) => println!("Go {version} 已安装"),
-            Err((version, err)) => failures.push(format!("Go {version} 安装失败：{err}")),
+            Ok((version, InstallStatus::Installed)) => println!("Installed Go {version}"),
+            Ok((version, InstallStatus::AlreadyPresent)) => {
+                println!("Go {version} is already installed");
+            }
+            Err((version, err)) => failures.push(format!("Failed to install Go {version}: {err}")),
         }
     }
     Ok(failures)
@@ -172,7 +176,7 @@ fn queue_plan(
     seen.push(plan.version.clone());
     let name = plan.version.to_string();
     if store::tool_exists(root, &name, "go") {
-        println!("Go {name} 已安装");
+        println!("Go {name} is already installed");
         return;
     }
     plans.push(plan);

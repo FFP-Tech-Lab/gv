@@ -18,7 +18,7 @@ struct Pre {
     n: u64,
 }
 
-/// 已安装或索引中的具体版本。补丁号缺失表示 `1.23rc1` 这种候选版本。
+/// A concrete version from an install or the index. A missing patch means a prerelease such as `1.23rc1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
     major: u64,
@@ -86,7 +86,7 @@ pub enum VersionQuery {
         major: u64,
         minor: u64,
     },
-    /// 仅用于 `gv install`。不进入版本文件，也不改变 `gv use`。
+    /// Only for `gv install`. It is not written to version files and does not change `gv use`.
     Latest,
 }
 
@@ -113,7 +113,7 @@ pub struct Resolved {
     pub origin: Origin,
 }
 
-/// `latest` 只在安装时合法。`gv use` 和版本文件仍走 `parse_user_spec`。
+/// `latest` is valid only for install. `gv use` and version files still go through `parse_user_spec`.
 pub fn parse_install_spec(input: &str) -> Result<VersionQuery, Error> {
     if input.trim().eq_ignore_ascii_case("latest") {
         return Ok(VersionQuery::Latest);
@@ -461,7 +461,7 @@ mod tests {
         let err = resolve(empty.path(), root.path(), None).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "未设置 Go 版本。请运行 gv use <version> 或 gv use --global <version>"
+            "No Go version is set. Run gv use <version> or gv use --global <version>"
         );
     }
 
@@ -473,7 +473,10 @@ mod tests {
         fs::write(root.path().join("version"), "1.4.0\n").unwrap();
         fs::write(project.path().join(".go-version"), "1.2.3\n").unwrap();
         let err = resolve(project.path(), root.path(), None).unwrap_err();
-        assert_eq!(err.to_string(), "未安装 Go 1.2.3。请运行 gv install 1.2.3");
+        assert_eq!(
+            err.to_string(),
+            "Go 1.2.3 is not installed. Run gv install 1.2.3"
+        );
     }
 
     #[test]

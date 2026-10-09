@@ -4,71 +4,71 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("未设置 Go 版本。请运行 gv use <version> 或 gv use --global <version>")]
+    #[error("No Go version is set. Run gv use <version> or gv use --global <version>")]
     NoVersion,
 
-    #[error("未安装 Go {0}。请运行 gv install {0}")]
+    #[error("Go {0} is not installed. Run gv install {0}")]
     NotInstalled(String),
 
-    #[error("无法识别的版本号：{0}")]
+    #[error("Unrecognized version: {0}")]
     BadVersion(String),
 
-    #[error("请指定完整版本号，不能只写 {0}")]
+    #[error("Specify a full version, not just {0}")]
     NeedExactVersion(String),
 
-    #[error("版本文件是空的：{0}")]
+    #[error("Version file is empty: {0}")]
     EmptyVersionFile(PathBuf),
 
-    #[error("版本 {0} 不在索引中")]
+    #[error("Version {0} is not in the index")]
     VersionNotInIndex(String),
 
-    #[error("索引中没有适用于 {os}/{arch} 的 Go {version} 安装包")]
+    #[error("The index has no Go {version} archive for {os}/{arch}")]
     NoArchive {
         version: String,
         os: String,
         arch: String,
     },
 
-    #[error("安装包文件名不安全：{0}")]
+    #[error("Unsafe archive filename: {0}")]
     UnsafeFilename(String),
 
-    #[error("不支持的平台：{0}/{1}。gv 仅支持 Linux 与 macOS 的 amd64 和 arm64")]
+    #[error("Unsupported platform: {0}/{1}. gv only supports Linux and macOS on amd64 and arm64")]
     UnsupportedPlatform(String, String),
 
-    #[error("不支持的 shell：{0}。仅支持 bash 和 zsh")]
+    #[error("Unsupported shell: {0}. Only bash and zsh are supported")]
     UnsupportedShell(String),
 
-    #[error("校验和不一致：期望 {expected}，实际 {actual}")]
+    #[error("Checksum mismatch: expected {expected}, got {actual}")]
     Checksum { expected: String, actual: String },
 
-    #[error("拒绝不安全的压缩包路径：{0}")]
+    #[error("Refusing unsafe archive path: {0}")]
     UnsafePath(String),
 
-    #[error("压缩包无效：{0}")]
+    #[error("Invalid archive: {0}")]
     BadArchive(String),
 
-    #[error("全局版本正指向 {0}。如需卸载请运行 gv uninstall {0} --force")]
+    #[error("The global version points at {0}. To uninstall it, run gv uninstall {0} --force")]
     UninstallBlocked(String),
 
-    #[error("该版本缺少 {tool}：{version}")]
+    #[error("This version is missing {tool}: {version}")]
     MissingTool { version: String, tool: String },
 
-    #[error("未找到 HOME，请设置 GV_ROOT")]
+    #[error("HOME was not found. Set GV_ROOT")]
     NoHome,
 
-    #[error("GV_ROOT 为空")]
+    #[error("GV_ROOT is empty")]
     EmptyRoot,
 
-    #[error("不能同时指定版本和 --unset")]
+    #[error("Cannot specify a version and --unset together")]
     VersionAndUnset,
 
-    #[error("请指定版本，或使用 --unset")]
+    #[error("Specify a version, or use --unset")]
     VersionRequired,
 
-    #[error("索引解析失败：{0}")]
+    #[error("Failed to parse the index: {0}")]
     IndexParse(String),
 
-    #[error("下载失败 {url}：{message}")]
+    #[error("Download failed {url}: {message}")]
     Http { url: String, message: String },
 
     #[error("{0}")]
