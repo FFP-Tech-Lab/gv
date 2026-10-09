@@ -114,11 +114,16 @@ enum Command {
 struct RunError {
     error: Error,
     quiet: bool,
+    shim: bool,
 }
 
 impl From<Error> for RunError {
     fn from(error: Error) -> Self {
-        Self { error, quiet: false }
+        Self {
+            error,
+            quiet: false,
+            shim: false,
+        }
     }
 }
 
@@ -144,7 +149,9 @@ fn report_error(err: &RunError) {
         if line.is_empty() {
             continue;
         }
-        if ui.animated() {
+        if err.shim {
+            eprintln!("gv: {line}");
+        } else if ui.animated() {
             eprint!("{}", ui::format_result(Tone::Failed, line, ui.color()));
         } else {
             eprintln!("gv: {line}");
@@ -154,7 +161,11 @@ fn report_error(err: &RunError) {
 
 fn run() -> Result<(), RunError> {
     if let Some(tool) = shim::invoked_tool() {
-        return shim::execute(tool).map_err(RunError::from);
+        return shim::execute(tool).map_err(|error| RunError {
+            error,
+            quiet: false,
+            shim: true,
+        });
     }
 
     let cli = Cli::parse();
@@ -165,7 +176,11 @@ fn run() -> Result<(), RunError> {
     match cli.command {
         Command::Install { versions, quiet } => {
             block_on(commands::install::run(&root, &versions, quiet))
-                .map_err(|error| RunError { error, quiet })?;
+                .map_err(|error| RunError {
+                    error,
+                    quiet,
+                    shim: false,
+                })?;
         }
         Command::Uninstall { versions, force } => {
             commands::uninstall::run(&root, &versions, force)?;
