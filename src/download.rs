@@ -414,6 +414,7 @@ fn cached_index(cache: IndexCache, warning: Option<String>, refresh_attempted: b
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn load_index(
     client: &reqwest::Client,
     root: &Path,
