@@ -770,6 +770,60 @@ fn list_json_keeps_text_output() {
         stdout.contains("\"current\":\"1.23.4\"") || stdout.contains("\"current\": \"1.23.4\"")
     );
     assert!(!stdout.contains('*'));
+    assert!(!stdout.contains('\u{1b}'));
+}
+
+#[test]
+fn list_output_stays_plain_when_stdout_is_not_a_terminal() {
+    let root = TempDir::new();
+    let cwd = TempDir::new();
+    install_fake_sdk(root.path(), "1.22.1");
+    install_fake_sdk(root.path(), "1.23.4");
+    fs::write(cwd.path().join(".go-version"), "1.23.4\n").unwrap();
+    seed_index(root.path(), &sample_remote_index());
+
+    for term in ["xterm-256color", "dumb"] {
+        let list = gv(root.path())
+            .current_dir(cwd.path())
+            .env("TERM", term)
+            .arg("list")
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "{}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let stdout = String::from_utf8(list.stdout).unwrap();
+        assert_eq!(stdout, "* 1.23.4\n  1.22.1\n");
+        assert!(!stdout.contains('\u{1b}'), "{term}: {stdout}");
+        assert!(list.stderr.is_empty(), "{term}");
+
+        let remote = gv(root.path())
+            .env("TERM", term)
+            .args(["list-remote", "--offline"])
+            .output()
+            .unwrap();
+        assert!(
+            remote.status.success(),
+            "{}",
+            String::from_utf8_lossy(&remote.stderr)
+        );
+        let stdout = String::from_utf8(remote.stdout).unwrap();
+        assert_eq!(stdout, "  1.24.0\n  1.22.5\n");
+        assert!(!stdout.contains('\u{1b}'), "{term}: {stdout}");
+
+        let json = gv(root.path())
+            .current_dir(cwd.path())
+            .env("TERM", term)
+            .args(["list", "--output", "json"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(json.stdout).unwrap();
+        assert!(stdout.contains("\"current\""));
+        assert!(!stdout.contains('\u{1b}'));
+        assert!(!stdout.contains("* 1.23.4"));
+    }
 }
 
 #[test]
@@ -819,12 +873,26 @@ fn list_remote_filters_and_marks_installed_versions() {
     seed_index(root.path(), &sample_remote_index());
     install_fake_sdk(root.path(), "1.24.0");
 
-    let exact = gv(root.path()).args(["list-remote", "1.24"]).output().unwrap();
-    assert!(exact.status.success(), "{}", String::from_utf8_lossy(&exact.stderr));
+    let exact = gv(root.path())
+        .args(["list-remote", "1.24"])
+        .output()
+        .unwrap();
+    assert!(
+        exact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
     assert_eq!(String::from_utf8(exact.stdout).unwrap(), "* 1.24.0\n");
 
-    let minor = gv(root.path()).args(["list-remote", "1.22"]).output().unwrap();
-    assert!(minor.status.success(), "{}", String::from_utf8_lossy(&minor.stderr));
+    let minor = gv(root.path())
+        .args(["list-remote", "1.22"])
+        .output()
+        .unwrap();
+    assert!(
+        minor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&minor.stderr)
+    );
     assert_eq!(String::from_utf8(minor.stdout).unwrap(), "  1.22.5\n");
 }
 
@@ -841,7 +909,11 @@ fn list_remote_offline_uses_a_stale_cache_without_a_warning() {
         started.elapsed() < std::time::Duration::from_secs(5),
         "offline list-remote contacted the network"
     );
-    assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+    assert!(
+        text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text.stderr)
+    );
     assert!(text.stderr.is_empty());
     assert_eq!(
         String::from_utf8(text.stdout).unwrap(),

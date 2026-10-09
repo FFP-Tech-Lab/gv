@@ -7,6 +7,7 @@ mod platform;
 mod resolve;
 mod shim;
 mod store;
+mod ui;
 
 #[cfg(test)]
 mod testutil;
@@ -145,6 +146,9 @@ fn run() -> Result<(), Error> {
                 commands::list::installed_report(&root, &cwd, gv_version.as_deref(), output)?;
             if let Some(warning) = report.warning {
                 eprintln!("gv: {warning}");
+            }
+            if commands::list::version_tui_enabled(output) {
+                commands::list::browse("Installed versions", &report.rows);
             }
             print!("{}", report.stdout);
         }

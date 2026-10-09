@@ -6,6 +6,7 @@ use crate::download::{self, IndexPolicy, RemoteVersion};
 use crate::error::Error;
 use crate::resolve;
 use crate::store;
+use crate::ui::{self, VersionRow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -16,6 +17,34 @@ pub enum OutputFormat {
 pub struct ListReport {
     pub stdout: String,
     pub warning: Option<String>,
+    pub rows: Vec<VersionRow>,
+}
+
+/// Interactive list only for text on a real terminal. JSON, a pipe, and `TERM=dumb`
+/// stay on the plain-text formatter. Completion runs `gv list` in a pipe, so it
+/// never opens this screen.
+pub fn wants_version_tui(stdout_is_tty: bool, term: Option<&str>, output: OutputFormat) -> bool {
+    matches!(output, OutputFormat::Text)
+        && stdout_is_tty
+        && !term.is_some_and(|value| value == "dumb")
+}
+
+pub fn version_tui_enabled(output: OutputFormat) -> bool {
+    let term = std::env::var("TERM").ok();
+    wants_version_tui(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        term.as_deref(),
+        output,
+    )
+}
+
+pub fn browse(title: &str, rows: &[VersionRow]) {
+    if rows.is_empty() || !version_tui_enabled(OutputFormat::Text) {
+        return;
+    }
+    if let Err(err) = ui::browse_versions(title, rows) {
+        eprintln!("gv: {err}");
+    }
 }
 
 pub fn installed_report(
@@ -36,7 +65,37 @@ pub fn installed_report(
         OutputFormat::Text => format_installed(&names, current.as_deref()),
         OutputFormat::Json => format_installed_json(&names, current.as_deref())?,
     };
-    Ok(ListReport { stdout, warning })
+    let rows = installed_rows(&names, current.as_deref());
+    Ok(ListReport {
+        stdout,
+        warning,
+        rows,
+    })
+}
+
+fn installed_rows(versions: &[String], current: Option<&str>) -> Vec<VersionRow> {
+    versions
+        .iter()
+        .map(|version| {
+            let resolved = Some(version.as_str()) == current;
+            VersionRow {
+                version: version.clone(),
+                starred: resolved,
+                resolved,
+            }
+        })
+        .collect()
+}
+
+pub fn remote_rows(versions: &[RemoteVersion], resolved: Option<&str>) -> Vec<VersionRow> {
+    versions
+        .iter()
+        .map(|version| VersionRow {
+            version: version.version.clone(),
+            starred: version.installed,
+            resolved: Some(version.version.as_str()) == resolved,
+        })
+        .collect()
 }
 
 pub fn format_installed(versions: &[String], current: Option<&str>) -> String {
@@ -134,6 +193,25 @@ pub async fn remote(
         OutputFormat::Text => download::format_remote(&rows),
         OutputFormat::Json => format_remote_json(&rows)?,
     };
+    if wants_version_tui(
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+        std::env::var("TERM").ok().as_deref(),
+        output,
+    ) {
+        let cwd = std::env::current_dir().ok();
+        let gv_version = std::env::var("GV_VERSION").ok();
+        let resolved = cwd.as_ref().and_then(|cwd| {
+            resolve::resolve(cwd, root, gv_version.as_deref())
+                .ok()
+                .map(|resolved| resolved.version.to_string())
+        });
+        let view = remote_rows(&rows, resolved.as_deref());
+        if !view.is_empty() {
+            if let Err(err) = ui::browse_versions("Remote versions", &view) {
+                eprintln!("gv: {err}");
+            }
+        }
+    }
     print!("{text}");
     Ok(())
 }
@@ -219,5 +297,33 @@ mod tests {
         assert_eq!(value["versions"][1]["stable"], false);
         assert_eq!(value["versions"][1]["installed"], false);
         assert_eq!(download::format_remote(&[stable]), "* 1.23.4\n");
+    }
+
+    #[test]
+    fn version_tui_falls_back_for_pipes_json_and_dumb_terminals() {
+        assert!(!wants_version_tui(
+            false,
+            Some("xterm-256color"),
+            OutputFormat::Text
+        ));
+        assert!(!wants_version_tui(true, Some("dumb"), OutputFormat::Text));
+        assert!(!wants_version_tui(true, Some("xterm"), OutputFormat::Json));
+        assert!(wants_version_tui(true, Some("xterm"), OutputFormat::Text));
+        assert!(wants_version_tui(true, None, OutputFormat::Text));
+
+        let plain = format_installed(&["1.23.4".into(), "1.22.1".into()], Some("1.23.4"));
+        assert_eq!(plain, "* 1.23.4\n  1.22.1\n");
+        assert!(!plain.contains('\u{1b}'));
+
+        let root = TempDir::new();
+        let cwd = TempDir::new();
+        touch_sdk(root.path(), "1.22.1");
+        touch_sdk(root.path(), "1.23.4");
+        fs::write(cwd.path().join(".go-version"), "1.23.4\n").unwrap();
+        let report = installed_report(root.path(), cwd.path(), None, OutputFormat::Text).unwrap();
+        assert_eq!(report.stdout, "* 1.23.4\n  1.22.1\n");
+        assert!(report.rows[0].resolved && report.rows[0].starred);
+        assert!(!report.rows[1].resolved);
+        assert!(!report.stdout.contains('\u{1b}'));
     }
 }
